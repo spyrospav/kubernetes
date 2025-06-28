@@ -18,14 +18,19 @@ package queue
 
 import (
 	"container/list"
+	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"k8s.io/kubernetes/pkg/scheduler/backend/heap"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/backend/heap"
+	"k8s.io/kubernetes/pkg/scheduler/awsqueues"
+	_ "k8s.io/kubernetes/pkg/scheduler/backend/heap"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 )
@@ -83,10 +88,11 @@ type unlockedActiveQueueReader interface {
 // unlockedActiveQueue defines activeQ methods that are not protected by the lock itself.
 // activeQueue.underLock() or activeQueue.underRLock() method should be used to protect these methods.
 type unlockedActiveQueue struct {
-	queue *heap.Heap[*framework.QueuedPodInfo]
+	//queue *heap.Heap[*framework.QueuedPodInfo]
+	queue awsqueues.PodQueue
 }
 
-func newUnlockedActiveQueue(queue *heap.Heap[*framework.QueuedPodInfo]) *unlockedActiveQueue {
+func newUnlockedActiveQueue(queue awsqueues.PodQueue) *unlockedActiveQueue {
 	return &unlockedActiveQueue{
 		queue: queue,
 	}
@@ -133,7 +139,8 @@ type activeQueue struct {
 
 	// activeQ is heap structure that scheduler actively looks at to find pods to
 	// schedule. Head of heap is the highest priority pod.
-	queue *heap.Heap[*framework.QueuedPodInfo]
+	//queue *heap.Heap[*framework.QueuedPodInfo]
+	queue awsqueues.PodQueue
 
 	// unlockedQueue is a wrapper of queue providing methods that are not locked themselves
 	// and can be used in the underLock() or underRLock().
@@ -188,6 +195,66 @@ type activeQueue struct {
 }
 
 func newActiveQueue(queue *heap.Heap[*framework.QueuedPodInfo], isSchedulingQueueHintEnabled bool, metricRecorder metrics.MetricAsyncRecorder, backoffQPopper backoffQPopper) *activeQueue {
+	aq := &activeQueue{
+		queue:                        queue,
+		inFlightPods:                 make(map[types.UID]*list.Element),
+		inFlightEvents:               list.New(),
+		isSchedulingQueueHintEnabled: isSchedulingQueueHintEnabled,
+		metricsRecorder:              metricRecorder,
+		unlockedQueue:                newUnlockedActiveQueue(queue),
+		backoffQPopper:               backoffQPopper,
+	}
+	aq.cond.L = &aq.lock
+
+	return aq
+}
+
+func newActiveQueueWithBackend(
+	isSchedulingQueueHintEnabled bool,
+	metricRecorder metrics.MetricAsyncRecorder,
+	backoffQPopper backoffQPopper,
+	lessFn framework.LessFunc,
+	useDynamo bool,
+	awsCfg aws.Config,
+) *activeQueue {
+	var queue awsqueues.PodQueue
+	if useDynamo {
+		ctx := context.Background()
+
+		// FIXME: Use the local DynamoDB endpoint for testing.
+		//dynaLocalURL := "http://host.docker.internal:8000"
+		localOpt := func(o *dynamodb.Options) {
+			//o.BaseEndpoint = aws.String(dynaLocalURL)
+		}
+
+		activeConfig := awsqueues.Config{
+			Backend:   awsqueues.BackendDynamoDB,
+			TableName: "scheduler-activeq",
+			QueueID:   "activeQ",
+		}
+
+		remotePQ, err := awsqueues.NewPriorityQueueAWS(
+			ctx,
+			awsCfg,
+			activeConfig,
+			[]func(*dynamodb.Options){localOpt},
+			nil)
+		if err != nil {
+			panic(fmt.Sprintf("activeQ AWS backend: %v", err))
+		}
+
+		queue = awsqueues.DDBPQ{Ctx: context.TODO(), Aws: remotePQ}
+	} else {
+		h := heap.NewWithRecorder(podInfoKeyFunc,
+			heap.LessFunc[*framework.QueuedPodInfo](lessFn),
+			metrics.NewActivePodsRecorder())
+		queue = awsqueues.HeapPQ{H: h}
+	}
+
+	if queue == nil {
+		panic("activeQ queue is nil")
+	}
+
 	aq := &activeQueue{
 		queue:                        queue,
 		inFlightPods:                 make(map[types.UID]*list.Element),
@@ -269,6 +336,9 @@ func (aq *activeQueue) unlockedPop(logger klog.Logger) (*framework.QueuedPodInfo
 		}
 		aq.cond.Wait()
 	}
+
+	logger.V(4).Info("Scheduling queue is ready to pop", "activeQLen", aq.queue.Len(), "backoffQLen", 0)
+
 	pInfo, err := aq.queue.Pop()
 	if err != nil {
 		if aq.backoffQPopper == nil {

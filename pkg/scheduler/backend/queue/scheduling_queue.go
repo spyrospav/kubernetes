@@ -29,7 +29,10 @@ package queue
 import (
 	"context"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"math/rand"
+	"os"
 	"reflect"
 	"sync"
 	"time"
@@ -45,7 +48,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/scheduler/backend/heap"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
@@ -332,7 +334,27 @@ func NewPriorityQueue(
 	isSchedulingQueueHintEnabled := utilfeature.DefaultFeatureGate.Enabled(features.SchedulerQueueingHints)
 	isPopFromBackoffQEnabled := utilfeature.DefaultFeatureGate.Enabled(features.SchedulerPopFromBackoffQ)
 
-	backoffQ := newBackoffQueue(options.clock, options.podInitialBackoffDuration, options.podMaxBackoffDuration, lessFn, isPopFromBackoffQEnabled)
+	var useDynamo bool
+	useDynamo = true
+
+	// Build AWS config once and share it
+	var awsCfg aws.Config
+	if useDynamo {
+		awsCfg = buildAWSConfig()
+		klog.Infof("Using DynamoDB backend for scheduler queues")
+	}
+
+	// Initialize the backoff queue with the backend.
+	backoffQ := newBackoffQueueWithBackend(
+		options.clock,
+		options.podInitialBackoffDuration,
+		options.podMaxBackoffDuration,
+		lessFn,
+		isPopFromBackoffQEnabled,
+		useDynamo,
+		awsCfg,
+	)
+
 	pq := &PriorityQueue{
 		clock:                             options.clock,
 		stop:                              make(chan struct{}),
@@ -347,15 +369,65 @@ func NewPriorityQueue(
 		isSchedulingQueueHintEnabled:      isSchedulingQueueHintEnabled,
 		isPopFromBackoffQEnabled:          isPopFromBackoffQEnabled,
 	}
+
 	var backoffQPopper backoffQPopper
 	if isPopFromBackoffQEnabled {
 		backoffQPopper = backoffQ
 	}
-	pq.activeQ = newActiveQueue(heap.NewWithRecorder(podInfoKeyFunc, heap.LessFunc[*framework.QueuedPodInfo](lessFn), metrics.NewActivePodsRecorder()), isSchedulingQueueHintEnabled, options.metricsRecorder, backoffQPopper)
+
+	// Initialize the active queue with the backend.
+	pq.activeQ = newActiveQueueWithBackend(
+		isSchedulingQueueHintEnabled,
+		options.metricsRecorder,
+		backoffQPopper,
+		lessFn,
+		useDynamo,
+		awsCfg)
+
 	pq.nsLister = informerFactory.Core().V1().Namespaces().Lister()
 	pq.nominator = newPodNominator(options.podLister)
 
 	return pq
+}
+
+func buildAWSConfig() aws.Config {
+	ctx := context.Background()
+
+	// First, try to load from mounted credentials in /root/.aws
+	if _, err := os.Stat("/root/.aws/credentials"); err == nil {
+		klog.Infof("Loading AWS credentials from /root/.aws")
+		cfg, err := config.LoadDefaultConfig(ctx,
+			config.WithRegion("us-east-1"),
+			config.WithSharedConfigFiles([]string{"/root/.aws/config"}),
+			config.WithSharedCredentialsFiles([]string{"/root/.aws/credentials"}),
+			config.WithSharedConfigProfile("kevin_dong"),
+		)
+		if err != nil {
+			klog.Errorf("Failed to load AWS config from mounted credentials: %v", err)
+			panic(fmt.Sprintf("buildAWSConfig from mounted creds: %v", err))
+		}
+
+		// Log the configuration for debugging
+		creds, err := cfg.Credentials.Retrieve(ctx)
+		if err != nil {
+			klog.Errorf("Failed to retrieve credentials: %v", err)
+			panic(fmt.Sprintf("Failed to retrieve credentials: %v", err))
+		}
+		klog.Infof("AWS credentials loaded successfull. AccessKeyID: %s...", creds.AccessKeyID[:10])
+
+		return cfg
+	}
+
+	// Fallback to environment variables or default credential chain
+	klog.Infof("Loading AWS credentials from environment/default chain")
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion("us-east-1"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("buildAWSConfig: %v", err))
+	}
+
+	return cfg
 }
 
 // Run starts the goroutine to pump from backoffQ to activeQ
