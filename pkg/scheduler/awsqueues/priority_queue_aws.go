@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"math/rand"
 	"strconv"
@@ -17,7 +19,6 @@ import (
 )
 
 var rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
-var ErrEmptyQueue = errors.New("empty AWS priority queue")
 
 const (
 	BackendDynamoDB Backend = "dynamodb"
@@ -46,6 +47,13 @@ type BackoffTimeFunc func(*framework.QueuedPodInfo) time.Time
 
 // LessFunc is a function type that compares two QueuedPodInfo objects.
 type LessFunc func(*framework.QueuedPodInfo, *framework.QueuedPodInfo) bool
+
+type wireQueuedPod struct {
+	PodJSON  []byte `json:"pod"`      // raw v1.Pod encoded once
+	Attempts int    `json:"attempts"` // cheap scalars
+	TS       int64  `json:"ts"`       // Unix-nanos
+	Backoff  int64  `json:"backoff,omitempty"`
+}
 
 // Config carries the runtime settings for a queue instance.
 type Config struct {
@@ -188,9 +196,10 @@ func (q *PriorityQueueAWS) List(ctx context.Context) ([]*framework.QueuedPodInfo
 		pods := make([]*framework.QueuedPodInfo, 0, len(out.Items))
 		for _, itm := range out.Items {
 			payload := itm["Payload"].(*types.AttributeValueMemberB).Value
-			var p framework.QueuedPodInfo
-			if err := json.Unmarshal(payload, &p); err == nil {
-				pods = append(pods, &p)
+			if pi, err := unmarshalQPI(payload); err == nil {
+				pods = append(pods, pi)
+			} else {
+				klog.Error(err, "Failed to unmarshal pod info", "item", itm)
 			}
 		}
 		return pods, nil
@@ -250,6 +259,8 @@ func (q *PriorityQueueAWS) addOrUpdateDynamo(ctx context.Context, pInfo *framewo
 		return err // real dynamo error
 	}
 
+	klog.Infof("Pod %s already exists in queue %s, updating it", pInfo.Pod.UID, q.cfg.QueueID)
+
 	// 2. simple UPDATE ------------------------------
 	_, err = q.dynamoClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(q.cfg.TableName),
@@ -286,11 +297,11 @@ func (q *PriorityQueueAWS) popBackoffDynamo(ctx context.Context) (*framework.Que
 	// For backoff queues with custom sorting (e.g., with priority),
 	// we need to fetch multiple items and apply the comparison function
 	if q.isBackoffQueue() && q.cfg.PriorityAware {
-		return q.popBackoffWithCustomSort(ctx)
+		return q.popBackoffWithPriority(ctx)
 	}
 
 	// Simple backoff queue - just pop the first item with completed backoff
-	return q.popBackoffSimple(ctx)
+	return q.popBackoff(ctx)
 }
 
 func (q *PriorityQueueAWS) popActiveDynamo(ctx context.Context) (*framework.QueuedPodInfo, error) {
@@ -312,6 +323,7 @@ func (q *PriorityQueueAWS) popActiveDynamo(ctx context.Context) (*framework.Queu
 			ConsistentRead:   aws.Bool(false),
 		})
 		if err != nil {
+			klog.Error(err, "Unable to query table for popping", "table", q.cfg.TableName)
 			return nil, err
 		}
 		if len(qout.Items) == 0 {
@@ -321,10 +333,13 @@ func (q *PriorityQueueAWS) popActiveDynamo(ctx context.Context) (*framework.Queu
 				return nil, err
 			}
 			if n == 0 {
-				return nil, ErrEmptyQueue
+				klog.Infof("Popping: %d items in queue %s", n, q.cfg.QueueID)
+				return nil, nil
 			}
 			// Queue is not empty → GSI replica hasn’t caught up yet.
 			// Light back-off before retrying.
+			klog.Infof("Queue %s is not empty, but GSI replica is stale; waiting for %d ms",
+				q.cfg.QueueID, spin+1)
 			time.Sleep(time.Duration(spin+1) * 2 * time.Millisecond)
 			continue
 		}
@@ -337,9 +352,11 @@ func (q *PriorityQueueAWS) popActiveDynamo(ctx context.Context) (*framework.Queu
 				// Someone else raced us; retry.
 				continue
 			}
+			klog.Error(err, "Unable to delete item from queue", "queue", q.cfg.QueueID, "uid", uid)
 			return nil, err
 		}
 		if pi == nil {
+			klog.Error("Deleted item was nil", "queue", q.cfg.QueueID, "uid", uid)
 			continue // extremely unlikely, but be safe.
 		}
 		return pi, nil
@@ -379,13 +396,14 @@ func (q *PriorityQueueAWS) peekBackoffDynamo(ctx context.Context) (*framework.Qu
 				continue
 			}
 
-			var pInfo framework.QueuedPodInfo
-			if err := json.Unmarshal(payloadAttr.Value, &pInfo); err != nil {
-				continue
+			pInfo, err := unmarshalQPI(payloadAttr.Value)
+			if err != nil {
+				klog.Error(err, "Failed to unmarshal pod info", "item", item)
+				continue // skip this item if unmarshalling fails
 			}
 
-			if selectedPod == nil || q.cfg.LessFunc(&pInfo, selectedPod) {
-				selectedPod = &pInfo
+			if selectedPod == nil || q.cfg.LessFunc(pInfo, selectedPod) {
+				selectedPod = pInfo
 			}
 		}
 
@@ -419,12 +437,12 @@ func (q *PriorityQueueAWS) peekBackoffDynamo(ctx context.Context) (*framework.Qu
 		return nil, fmt.Errorf("payload attribute missing")
 	}
 
-	var pInfo framework.QueuedPodInfo
-	if err := json.Unmarshal(payloadAttr.Value, &pInfo); err != nil {
+	pInfo, err := unmarshalQPI(payloadAttr.Value)
+	if err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	return &pInfo, nil
+	return pInfo, nil
 }
 
 func (q *PriorityQueueAWS) peekActiveDynamo(ctx context.Context) (*framework.QueuedPodInfo, error) {
@@ -458,12 +476,361 @@ func (q *PriorityQueueAWS) peekActiveDynamo(ctx context.Context) (*framework.Que
 		return nil, fmt.Errorf("payload attribute missing")
 	}
 
-	var pInfo framework.QueuedPodInfo
-	if err := json.Unmarshal(payloadAttr.Value, &pInfo); err != nil {
+	pInfo, err := unmarshalQPI(payloadAttr.Value)
+	if err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
 
-	return &pInfo, nil
+	return pInfo, nil
+}
+
+// ---------------------------  HELPERS  --------------------------- //
+
+// Prepare the DynamoDB item with proper sort key based on queue type
+func (q *PriorityQueueAWS) prepareDynamoItem(pInfo *framework.QueuedPodInfo) (map[string]types.AttributeValue, error) {
+	// 1. priority value ------------------------------------------------------
+	pr := int32(0)
+	if pInfo.Pod.Spec.Priority != nil {
+		pr = *pInfo.Pod.Spec.Priority
+	}
+
+	// 2. choose time component ----------------------------------------------
+	var (
+		ts int64     // *numeric* sort key for the GSI
+		bo time.Time // real back-off completion, if any
+	)
+
+	if q.isBackoffQueue() {
+		if q.cfg.GetBackoffTime != nil {
+			bo = q.cfg.GetBackoffTime(pInfo)
+		} else {
+			// Should never happen, but be safe
+			klog.Error(nil, "Backoff time not set", "pod", pInfo.Pod)
+			return nil, fmt.Errorf("backoff time not set for pod %s", pInfo.Pod.UID)
+		}
+		includePr := q.cfg.PriorityAware
+		ts = encodeBackoffSK(bo.UnixMilli(), pr, includePr)
+	} else {
+		ts = encodeActiveSK(pr, time.Now())
+	}
+
+	// 3. marshal payload -----------------------------------------------------
+	payload, err := marshalQPI(pInfo)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pod: %w", err)
+	}
+
+	// 4. build the item ------------------------------------------------------
+	item := map[string]types.AttributeValue{
+		"PK":         &types.AttributeValueMemberS{Value: q.pk()},
+		"SK":         &types.AttributeValueMemberS{Value: string(pInfo.Pod.UID)},
+		AttrTS:       &types.AttributeValueMemberN{Value: strconv.FormatInt(ts, 10)},
+		AttrPriority: &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pr), 10)},
+		"Payload":    &types.AttributeValueMemberB{Value: payload},
+		"Timestamp":  &types.AttributeValueMemberN{Value: strconv.FormatInt(pInfo.Timestamp.UnixMilli(), 10)},
+		"Attempts":   &types.AttributeValueMemberN{Value: strconv.Itoa(pInfo.Attempts)},
+	}
+	if q.isBackoffQueue() {
+		item["BackoffCompletes"] = &types.AttributeValueMemberN{
+			Value: strconv.FormatInt(bo.UnixMilli(), 10),
+		}
+	}
+	return item, nil
+}
+
+// popBackoff handles simple time-based backoff queues
+func (q *PriorityQueueAWS) popBackoff(ctx context.Context) (*framework.QueuedPodInfo, error) {
+	for {
+		qout, err := q.dynamoClient.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(q.cfg.TableName),
+			IndexName:              aws.String(IndexTSName), // *** GSI ***
+			KeyConditionExpression: aws.String("PK = :pk AND TS <= :now"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":  &types.AttributeValueMemberS{Value: q.pk()},
+				":now": &types.AttributeValueMemberN{Value: upperBoundTS(time.Now().UnixMilli())},
+			},
+			Limit:            aws.Int32(1),
+			ScanIndexForward: aws.Bool(true),
+			ConsistentRead:   aws.Bool(false),
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(qout.Items) == 0 {
+			return nil, nil
+		}
+		uid := qout.Items[0]["SK"].(*types.AttributeValueMemberS).Value
+		pi, err := q.deleteByPodUID(ctx, uid)
+		if err != nil {
+			var ccfe *types.ConditionalCheckFailedException
+			if errors.As(err, &ccfe) {
+				continue
+			}
+			return nil, err
+		}
+		return pi, nil
+	}
+}
+
+// popBackoffWithPriority handles backoff queues with priority-aware sorting
+func (q *PriorityQueueAWS) popBackoffWithPriority(ctx context.Context) (*framework.QueuedPodInfo, error) {
+	// Fetch a batch of items with completed backoff
+	qout, err := q.dynamoClient.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(q.cfg.TableName),
+		IndexName:              aws.String(IndexTSName),
+		KeyConditionExpression: aws.String("PK = :pk AND TS <= :now"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":  &types.AttributeValueMemberS{Value: q.pk()},
+			":now": &types.AttributeValueMemberN{Value: upperBoundTS(time.Now().UnixMilli())},
+		},
+		Limit:            aws.Int32(100), // Fetch more items for comparison
+		ScanIndexForward: aws.Bool(true),
+		ConsistentRead:   aws.Bool(false),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(qout.Items) == 0 {
+		return nil, nil // No items with completed backoff
+	}
+
+	// Find the item that should be popped according to the LessFunc
+	var selectedItem map[string]types.AttributeValue
+	var selectedPod *framework.QueuedPodInfo
+
+	for _, item := range qout.Items {
+		// Unmarshal the pod info
+		payloadAttr, ok := item["Payload"].(*types.AttributeValueMemberB)
+		if !ok {
+			continue
+		}
+
+		pInfo, err := unmarshalQPI(payloadAttr.Value)
+		if err != nil {
+			klog.Error(err, "Failed to unmarshal pod info", "item", item)
+			continue // skip this item if unmarshalling fails
+		}
+
+		// Apply the comparison function
+		if selectedPod == nil || q.cfg.LessFunc(pInfo, selectedPod) {
+			selectedItem = item
+			selectedPod = pInfo
+		}
+	}
+
+	if selectedItem == nil {
+		return nil, nil
+	}
+
+	// Delete the selected item
+	uid := selectedItem["SK"].(*types.AttributeValueMemberS).Value
+	for {
+		pi, err := q.deleteByPodUID(ctx, uid)
+		if err != nil {
+			var ccfe *types.ConditionalCheckFailedException
+			if errors.As(err, &ccfe) {
+				// Someone else got it, retry selection
+				return q.popBackoffWithPriority(ctx)
+			}
+			return nil, err
+		}
+		return pi, nil
+	}
+}
+
+// deleteByPodUID deletes a pod from the DynamoDB queue by its UID and returns the deleted pod info.
+func (q *PriorityQueueAWS) deleteByPodUID(ctx context.Context, uid string) (*framework.QueuedPodInfo, error) {
+	dout, err := q.dynamoClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(q.cfg.TableName),
+		Key: map[string]types.AttributeValue{
+			"PK": &types.AttributeValueMemberS{Value: q.pk()},
+			"SK": &types.AttributeValueMemberS{Value: uid},
+		},
+		ConditionExpression: aws.String("attribute_exists(PK)"),
+		ReturnValues:        types.ReturnValueAllOld,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pa, ok := dout.Attributes["Payload"].(*types.AttributeValueMemberB)
+	if !ok {
+		return nil, fmt.Errorf("payload missing")
+	}
+	return unmarshalQPI(pa.Value)
+}
+
+// turn full QueuedPodInfo → wire bytes
+func marshalQPI(q *framework.QueuedPodInfo) ([]byte, error) {
+	pb, err := json.Marshal(q.Pod) // only the real API object
+	if err != nil {
+		return nil, err
+	}
+	w := wireQueuedPod{
+		PodJSON:  pb,
+		Attempts: q.Attempts,
+		TS:       q.Timestamp.UnixNano(),
+	}
+	if !q.BackoffExpiration.IsZero() {
+		w.Backoff = q.BackoffExpiration.UnixNano()
+	}
+	return json.Marshal(&w)
+}
+
+// turn wire bytes → full QueuedPodInfo (re-builds selectors etc.)
+func unmarshalQPI(b []byte) (*framework.QueuedPodInfo, error) {
+	var w wireQueuedPod
+	if err := json.Unmarshal(b, &w); err != nil {
+		return nil, err
+	}
+	var pod v1.Pod
+	if err := json.Unmarshal(w.PodJSON, &pod); err != nil {
+		return nil, err
+	}
+	pi, err := framework.NewPodInfo(&pod) // <- does the heavy work
+	if err != nil {
+		return nil, err
+	}
+	return &framework.QueuedPodInfo{
+		PodInfo:           pi,
+		Attempts:          w.Attempts,
+		Timestamp:         time.Unix(0, w.TS),
+		BackoffExpiration: time.Unix(0, w.Backoff),
+	}, nil
+}
+
+func encodeActiveSK(priority int32, t time.Time) int64 {
+	// Build a 64-bit key whose natural ascending order is:
+	// higher priority first (negated 16-bit),
+	// then older millis,
+	// with an 8-bit random suffix for uniqueness.
+
+	capped := priority
+	switch {
+	case capped < 0:
+		capped = 0
+	case capped > 0xFFFF:
+		capped = 0xFFFF
+	}
+
+	hi := int64(-capped) << 48
+	lo := t.UnixMilli()*milliFactor + int64(rnd.Intn(uniqRange))
+	return hi | (lo & ((1 << 48) - 1))
+}
+
+func encodeBackoffSK(backoffMillis int64, pr int32, withPr bool) int64 {
+	// Build a 64-bit back-off key whose ascending order is:
+	// earlier back-off-completion millis first,
+	// then (optionally) higher priority via an 8-bit bucket,
+	// with a tiny random slice for uniqueness.
+
+	suffix := int64(rnd.Intn(uniqRange)) // 0-9
+	if withPr {
+		bucket := pr
+		if bucket < 0 {
+			bucket = 0
+		} else if bucket > maxPrBucket {
+			bucket = maxPrBucket
+		}
+		suffix += int64(maxPrBucket-int(bucket)) * uniqRange
+	}
+	return backoffMillis*milliFactor + suffix
+}
+
+func upperBoundTS(nowMillis int64) string {
+	return strconv.FormatInt(nowMillis*milliFactor+maxSuffix, 10)
+}
+
+func (q *PriorityQueueAWS) isBackoffQueue() bool {
+	return q.cfg.QueueID == "backoffQ" || q.cfg.QueueID == "errorBackoffQ"
+}
+
+func (q *PriorityQueueAWS) pk() string { return q.cfg.QueueID }
+
+func reverse[T any](s []T) []T {
+	r := make([]T, len(s))
+	for i, v := range s {
+		r[len(s)-1-i] = v
+	}
+	return r
+}
+
+func (q *PriorityQueueAWS) ensureDynamoTable(ctx context.Context, ddb *dynamodb.Client, name string) error {
+	// fast-path: table exists
+	if _, err := ddb.DescribeTable(ctx, &dynamodb.DescribeTableInput{
+		TableName: aws.String(name),
+	}); err == nil {
+		return nil
+	} else if !errors.As(err, new(*types.ResourceNotFoundException)) {
+		return err // real failure
+	}
+
+	// create with PK/SK schema
+	_, err := ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(name),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String(AttrTS), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
+		},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
+			{
+				IndexName: aws.String(IndexTSName),
+				KeySchema: []types.KeySchemaElement{
+					{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
+					{AttributeName: aws.String(AttrTS), KeyType: types.KeyTypeRange},
+				},
+				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+			},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	return err
+}
+
+func (q *PriorityQueueAWS) ensureSQSQueues(ctx context.Context) error {
+	nb := q.cfg.NumBuckets
+	if nb <= 0 {
+		nb = defaultBuckets
+	}
+
+	prefix := q.cfg.QueuePrefix
+	if prefix == "" {
+		prefix = "scheduler-priority"
+	}
+
+	ensure := func(name string) (string, error) {
+		out, err := q.sqsClient.CreateQueue(ctx, &sqs.CreateQueueInput{
+			QueueName: aws.String(name),
+		})
+		if err != nil {
+			return "", err
+		}
+		return *out.QueueUrl, nil
+	}
+
+	// Create the system and critical queues, and the bucket queues.
+	var err error
+	if q.systemURL, err = ensure(prefix + "-system"); err != nil {
+		return err
+	}
+	if q.criticalURL, err = ensure(prefix + "-critical"); err != nil {
+		return err
+	}
+
+	q.bucketURLs = make([]string, nb)
+	for i := 0; i < nb; i++ {
+		if q.bucketURLs[i], err = ensure(
+			fmt.Sprintf("%s-bucket-%d", prefix, i)); err != nil {
+			return err
+		}
+	}
+	q.bucketSize = normalMaxPriority / int32(nb)
+	return nil
 }
 
 // ---------------------------  SQS (NOT FINISHED)  --------------------------- //
@@ -574,353 +941,6 @@ func (q *PriorityQueueAWS) peekSQS(ctx context.Context) (*framework.QueuedPodInf
 	return nil, nil // all queues empty
 }
 
-// ---------------------------  HELPERS  --------------------------- //
-
-// Prepare the DynamoDB item with proper sort key based on queue type
-func (q *PriorityQueueAWS) prepareDynamoItem(pInfo *framework.QueuedPodInfo) (map[string]types.AttributeValue, error) {
-	// 1. priority value ------------------------------------------------------
-	pr := int32(0)
-	if pInfo.Pod.Spec.Priority != nil {
-		pr = *pInfo.Pod.Spec.Priority
-	}
-
-	// 2. choose time component ----------------------------------------------
-	var (
-		ts int64     // *numeric* sort key for the GSI
-		bo time.Time // real back-off completion, if any
-	)
-
-	if q.isBackoffQueue() {
-		if q.cfg.GetBackoffTime != nil {
-			bo = q.cfg.GetBackoffTime(pInfo)
-		} else {
-			// TODO: implement fallback backoff calculation, but this should never happen
-			bo = q.calculateBackoffTime(pInfo)
-		}
-		includePr := q.cfg.PriorityAware
-		ts = encodeBackoffSK(bo.UnixMilli(), pr, includePr)
-	} else {
-		ts = encodeSortKey(pr, time.Now())
-	}
-
-	// 3. marshal payload -----------------------------------------------------
-	payload, err := json.Marshal(pInfo)
-	if err != nil {
-		return nil, fmt.Errorf("marshal pod: %w", err)
-	}
-
-	// 4. build the item ------------------------------------------------------
-	item := map[string]types.AttributeValue{
-		"PK":         &types.AttributeValueMemberS{Value: q.pk()},
-		"SK":         &types.AttributeValueMemberS{Value: string(pInfo.Pod.UID)},
-		AttrTS:       &types.AttributeValueMemberN{Value: strconv.FormatInt(ts, 10)},
-		AttrPriority: &types.AttributeValueMemberN{Value: strconv.FormatInt(int64(pr), 10)},
-		"Payload":    &types.AttributeValueMemberB{Value: payload},
-		"Timestamp":  &types.AttributeValueMemberN{Value: strconv.FormatInt(pInfo.Timestamp.UnixMilli(), 10)},
-		"Attempts":   &types.AttributeValueMemberN{Value: strconv.Itoa(pInfo.Attempts)},
-	}
-	if q.isBackoffQueue() {
-		item["BackoffCompletes"] = &types.AttributeValueMemberN{
-			Value: strconv.FormatInt(bo.UnixMilli(), 10),
-		}
-	}
-	return item, nil
-}
-
-// popBackoffWithCustomSort handles backoff queues with priority-aware sorting
-func (q *PriorityQueueAWS) popBackoffWithCustomSort(ctx context.Context) (*framework.QueuedPodInfo, error) {
-	// Fetch a batch of items with completed backoff
-	qout, err := q.dynamoClient.Query(ctx, &dynamodb.QueryInput{
-		TableName:              aws.String(q.cfg.TableName),
-		IndexName:              aws.String(IndexTSName),
-		KeyConditionExpression: aws.String("PK = :pk AND TS <= :now"),
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":pk":  &types.AttributeValueMemberS{Value: q.pk()},
-			":now": &types.AttributeValueMemberN{Value: upperBoundTS(time.Now().UnixMilli())},
-		},
-		Limit:            aws.Int32(100), // Fetch more items for comparison
-		ScanIndexForward: aws.Bool(true),
-		ConsistentRead:   aws.Bool(false),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(qout.Items) == 0 {
-		return nil, nil // No items with completed backoff
-	}
-
-	// Find the item that should be popped according to the LessFunc
-	var selectedItem map[string]types.AttributeValue
-	var selectedPod *framework.QueuedPodInfo
-
-	for _, item := range qout.Items {
-		// Unmarshal the pod info
-		payloadAttr, ok := item["Payload"].(*types.AttributeValueMemberB)
-		if !ok {
-			continue
-		}
-
-		var pInfo framework.QueuedPodInfo
-		if err := json.Unmarshal(payloadAttr.Value, &pInfo); err != nil {
-			continue
-		}
-
-		// Apply the comparison function
-		if selectedPod == nil || q.cfg.LessFunc(&pInfo, selectedPod) {
-			selectedItem = item
-			selectedPod = &pInfo
-		}
-	}
-
-	if selectedItem == nil {
-		return nil, nil
-	}
-
-	// Delete the selected item
-	uid := selectedItem["SK"].(*types.AttributeValueMemberS).Value
-	for {
-		pi, err := q.deleteByPodUID(ctx, uid)
-		if err != nil {
-			var ccfe *types.ConditionalCheckFailedException
-			if errors.As(err, &ccfe) {
-				// Someone else got it, retry selection
-				return q.popBackoffWithCustomSort(ctx)
-			}
-			return nil, err
-		}
-		return pi, nil
-	}
-}
-
-// popBackoffSimple handles simple time-based backoff queues
-func (q *PriorityQueueAWS) popBackoffSimple(ctx context.Context) (*framework.QueuedPodInfo, error) {
-	for {
-		qout, err := q.dynamoClient.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(q.cfg.TableName),
-			IndexName:              aws.String(IndexTSName), // *** GSI ***
-			KeyConditionExpression: aws.String("PK = :pk AND TS <= :now"),
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":pk":  &types.AttributeValueMemberS{Value: q.pk()},
-				":now": &types.AttributeValueMemberN{Value: upperBoundTS(time.Now().UnixMilli())},
-			},
-			Limit:            aws.Int32(1),
-			ScanIndexForward: aws.Bool(true),
-			ConsistentRead:   aws.Bool(false),
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(qout.Items) == 0 {
-			return nil, nil
-		}
-		uid := qout.Items[0]["SK"].(*types.AttributeValueMemberS).Value
-		pi, err := q.deleteByPodUID(ctx, uid)
-		if err != nil {
-			var ccfe *types.ConditionalCheckFailedException
-			if errors.As(err, &ccfe) {
-				continue
-			}
-			return nil, err
-		}
-		return pi, nil
-	}
-}
-
-// encodeBackoffSK builds a monotonic key.
-// *withPr* = true  ➜ higher priority → smaller key inside the same ms
-// *withPr* = false ➜ suffix only keeps the key unique.
-func encodeBackoffSK(backoffMillis int64, pr int32, withPr bool) int64 {
-	suffix := int64(rnd.Intn(uniqRange)) // 0-9
-	if withPr {
-		bucket := pr
-		if bucket < 0 {
-			bucket = 0
-		} else if bucket > maxPrBucket {
-			bucket = maxPrBucket
-		}
-		suffix += int64(maxPrBucket-int(bucket)) * uniqRange
-	}
-	return backoffMillis*milliFactor + suffix
-}
-
-func upperBoundTS(nowMillis int64) string {
-	return strconv.FormatInt(nowMillis*milliFactor+maxSuffix, 10)
-}
-
-func (q *PriorityQueueAWS) deleteByPodUID(ctx context.Context, uid string) (*framework.QueuedPodInfo, error) {
-	dout, err := q.dynamoClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String(q.cfg.TableName),
-		Key: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: q.pk()},
-			"SK": &types.AttributeValueMemberS{Value: uid},
-		},
-		ConditionExpression: aws.String("attribute_exists(PK)"),
-		ReturnValues:        types.ReturnValueAllOld,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	pa, ok := dout.Attributes["Payload"].(*types.AttributeValueMemberB)
-	if !ok {
-		return nil, fmt.Errorf("payload missing")
-	}
-	var pi framework.QueuedPodInfo
-	if err := json.Unmarshal(pa.Value, &pi); err != nil {
-		return nil, err
-	}
-	return &pi, nil
-}
-
-func encodeSortKey(priority int32, t time.Time) int64 {
-	// encodeSortKey returns a key where
-	//   – higher priority ⇒ **smaller** key
-	//   – keys are strictly monotonic even when several pods are en-queued
-	//     in the same millisecond (8-bit random suffix)
-	//
-	// layout (big-endian):
-	//   16 bits  –  –priority          (0…65 535)
-	//   48 bits  –  millis*256 + rand  (0…281 474 976 710 655)
-	//
-
-	const (
-		prShift = 48 // bucket for the two top-bytes
-		mask48  = (1 << prShift) - 1
-	)
-
-	// high-order 16 bits – inverse priority
-	hi := int64(-priority) << prShift
-
-	// low-order 48 bits – millisecond timestamp + 8-bit suffix
-	lo := t.UnixMilli()*milliFactor + int64(rnd.Intn(uniqRange))
-
-	return hi | (lo & mask48)
-}
-
-// Helper to check if this is a backoff queue
-func (q *PriorityQueueAWS) isBackoffQueue() bool {
-	return q.cfg.QueueID == "backoffQ" || q.cfg.QueueID == "errorBackoffQ"
-}
-
-// Calculate backoff completion time
-func (q *PriorityQueueAWS) calculateBackoffTime(pInfo *framework.QueuedPodInfo) time.Time {
-	// Base backoff parameters (should match your scheduler's configuration)
-	baseBackoff := 1 * time.Second
-	maxBackoff := 10 * time.Minute
-
-	// Calculate exponential backoff
-	backoffDuration := baseBackoff
-	attempts := pInfo.Attempts
-	if attempts <= 0 {
-		attempts = 1
-	}
-
-	// Exponential backoff: 2^(attempts-1) * baseBackoff
-	for i := 1; i < attempts && i < 16; i++ { // Cap at 16 to prevent overflow
-		backoffDuration *= 2
-		if backoffDuration > maxBackoff {
-			backoffDuration = maxBackoff
-			break
-		}
-	}
-
-	// If we have an initial attempt timestamp, use it as the base
-	if pInfo.InitialAttemptTimestamp != nil {
-		return pInfo.InitialAttemptTimestamp.Add(backoffDuration)
-	}
-
-	// Otherwise, calculate from now
-	return time.Now().Add(backoffDuration)
-}
-
-func (q *PriorityQueueAWS) pk() string { return q.cfg.QueueID }
-
-func reverse[T any](s []T) []T {
-	r := make([]T, len(s))
-	for i, v := range s {
-		r[len(s)-1-i] = v
-	}
-	return r
-}
-
-func (q *PriorityQueueAWS) ensureDynamoTable(ctx context.Context, ddb *dynamodb.Client, name string) error {
-	// fast-path: table exists
-	if _, err := ddb.DescribeTable(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(name),
-	}); err == nil {
-		return nil
-	} else if !errors.As(err, new(*types.ResourceNotFoundException)) {
-		return err // real failure
-	}
-
-	// create with PK/SK schema
-	_, err := ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName: aws.String(name),
-		AttributeDefinitions: []types.AttributeDefinition{
-			{AttributeName: aws.String("PK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String("SK"), AttributeType: types.ScalarAttributeTypeS},
-			{AttributeName: aws.String(AttrTS), AttributeType: types.ScalarAttributeTypeN},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
-			{AttributeName: aws.String("SK"), KeyType: types.KeyTypeRange},
-		},
-		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{
-			{
-				IndexName: aws.String(IndexTSName),
-				KeySchema: []types.KeySchemaElement{
-					{AttributeName: aws.String("PK"), KeyType: types.KeyTypeHash},
-					{AttributeName: aws.String(AttrTS), KeyType: types.KeyTypeRange},
-				},
-				Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
-			},
-		},
-		BillingMode: types.BillingModePayPerRequest,
-	})
-	return err
-}
-
-func (q *PriorityQueueAWS) ensureSQSQueues(ctx context.Context) error {
-	nb := q.cfg.NumBuckets
-	if nb <= 0 {
-		nb = defaultBuckets
-	}
-
-	prefix := q.cfg.QueuePrefix
-	if prefix == "" {
-		prefix = "scheduler-priority"
-	}
-
-	ensure := func(name string) (string, error) {
-		out, err := q.sqsClient.CreateQueue(ctx, &sqs.CreateQueueInput{
-			QueueName: aws.String(name),
-		})
-		if err != nil {
-			return "", err
-		}
-		return *out.QueueUrl, nil
-	}
-
-	// Create the system and critical queues, and the bucket queues.
-	var err error
-	if q.systemURL, err = ensure(prefix + "-system"); err != nil {
-		return err
-	}
-	if q.criticalURL, err = ensure(prefix + "-critical"); err != nil {
-		return err
-	}
-
-	q.bucketURLs = make([]string, nb)
-	for i := 0; i < nb; i++ {
-		if q.bucketURLs[i], err = ensure(
-			fmt.Sprintf("%s-bucket-%d", prefix, i)); err != nil {
-			return err
-		}
-	}
-	q.bucketSize = normalMaxPriority / int32(nb)
-	return nil
-}
-
 // ---------------------------  DEPRECATED  --------------------------- //
 
 // Add enqueues a pod into the priority queue.
@@ -950,7 +970,7 @@ func (q *PriorityQueueAWS) addDynamo(ctx context.Context, pInfo *framework.Queue
 	//if q.cfg.QueueID == "backoffQ" || q.cfg.QueueID == "errorBackoffQ" {
 	//	sk = getBackoffTime(pInfo).UnixMilli()
 	//} else {
-	sk = encodeSortKey(pr, time.Now())
+	sk = encodeActiveSK(pr, time.Now())
 	//}
 
 	// 2 — marshal the payload

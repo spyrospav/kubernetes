@@ -497,14 +497,6 @@ func TestDynamoCountAccuracyUnderChurn(t *testing.T) {
 	}
 }
 
-func TestPopEmptyReturnsError(t *testing.T) {
-	ctx, pq := setUpFreshActiveQueue(t)
-	got, err := pq.Pop(ctx)
-	if err == nil || got != nil {
-		t.Fatalf("expected (nil, error), got (%v, %v)", got, err)
-	}
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers
 ////////////////////////////////////////////////////////////////////////////////

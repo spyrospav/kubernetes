@@ -228,9 +228,10 @@ func (bq *backoffQueue) GetBackoffTimeFunc() awsqueues.BackoffTimeFunc {
 }
 
 func (bq *backoffQueue) GetLessFunc(useWithPriority bool) awsqueues.LessFunc {
-	if useWithPriority {
-		return bq.lessBackoffCompletedWithPriority
-	}
+	// FIXME: Force to use the simple less function for simplicity.
+	//if useWithPriority {
+	//	return bq.lessBackoffCompletedWithPriority
+	//}
 	return bq.lessBackoffCompleted
 }
 
@@ -379,7 +380,7 @@ func (bq *backoffQueue) popAllBackoffCompletedWithQueue(logger klog.Logger, queu
 		}
 		poppedPods = append(poppedPods, pInfo)
 	}
-	logger.V(4).Info("Popping pods from backoff queue", "count", len(poppedPods))
+	//logger.V(4).Info("Popping pods from backoff queue", "count", len(poppedPods))
 	return poppedPods
 }
 

@@ -55,16 +55,7 @@ func (q DDBPQ) Get(*framework.QueuedPodInfo) (*framework.QueuedPodInfo, bool) {
 }
 func (q DDBPQ) Has(*framework.QueuedPodInfo) bool       { return false }
 func (q DDBPQ) Delete(p *framework.QueuedPodInfo) error { return q.Aws.Delete(q.Ctx, p) }
-func (q DDBPQ) Pop() (*framework.QueuedPodInfo, error) {
-	pi, err := q.Aws.Pop(q.Ctx)
-	if err != nil {
-		return nil, err
-	}
-	if pi == nil {
-		return nil, ErrEmptyQueue
-	}
-	return pi, nil
-}
+func (q DDBPQ) Pop() (*framework.QueuedPodInfo, error)  { return q.Aws.Pop(q.Ctx) }
 func (q DDBPQ) Peek() (*framework.QueuedPodInfo, bool) {
 	pInfo, err := q.Aws.Peek(q.Ctx)
 	if err != nil || pInfo == nil {
