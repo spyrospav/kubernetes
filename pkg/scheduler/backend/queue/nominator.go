@@ -17,13 +17,17 @@ limitations under the License.
 package queue
 
 import (
-	"slices"
+	"context"
+	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
@@ -42,21 +46,50 @@ type nominator struct {
 	nLock sync.RWMutex
 
 	// podLister is used to verify if the given pod is alive.
-	podLister listersv1.PodLister
+	//podLister listersv1.PodLister
+	client kubernetes.Interface
+
 	// nominatedPods is a map keyed by a node name and the value is a list of
 	// pods which are nominated to run on the node. These are pods which can be in
 	// the activeQ or unschedulablePods.
-	nominatedPods map[string][]podRef
+	//nominatedPods map[string][]podRef
 	// nominatedPodToNode is map keyed by a Pod UID to the node name where it is
 	// nominated.
-	nominatedPodToNode map[types.UID]string
+	//nominatedPodToNode map[types.UID]string
+
+	store awsstore.NominatedStore
 }
 
-func newPodNominator(podLister listersv1.PodLister) *nominator {
+func newPodNominator(client kubernetes.Interface) *nominator {
+	useDynamo := true
+
+	var store awsstore.NominatedStore
+	var err error
+
+	if useDynamo {
+		awsCfg := awsstore.BuildAWSConfig()
+		klog.Infof("Using DynamoDB backend for nominator maps")
+
+		ddb := dynamodb.NewFromConfig(awsCfg)
+		if err = awsstore.EnsurePartitionStoreTable(context.Background(), ddb, awsstore.PartitionStoreTableName); err != nil {
+			panic(fmt.Sprintf("Failed to ensure partition store table: %v", err))
+		}
+
+		store, err = awsstore.NewDDBNominatedStore(context.Background(), ddb, true)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		store = awsstore.NewMemNominatedStore()
+		klog.Infof("Using in-memory backend for nominator maps")
+	}
+
 	return &nominator{
-		podLister:          podLister,
-		nominatedPods:      make(map[string][]podRef),
-		nominatedPodToNode: make(map[types.UID]string),
+		client: client,
+		// You can remove these maps if you fully moved to the store:
+		// nominatedPods:      make(map[string][]podRef),
+		// nominatedPodToNode: make(map[types.UID]string),
+		store: store,
 	}
 }
 
@@ -64,13 +97,13 @@ func newPodNominator(podLister listersv1.PodLister) *nominator {
 // This is called during the preemption process after a node is nominated to run
 // the pod. We update the structure before sending a request to update the pod
 // object to avoid races with the following scheduling cycles.
-func (npm *nominator) AddNominatedPod(logger klog.Logger, pi *framework.PodInfo, nominatingInfo *framework.NominatingInfo) {
+func (npm *nominator) AddNominatedPod(ctx context.Context, logger klog.Logger, pi *framework.PodInfo, nominatingInfo *framework.NominatingInfo) {
 	npm.nLock.Lock()
-	npm.addNominatedPodUnlocked(logger, pi, nominatingInfo)
+	npm.addNominatedPodUnlocked(ctx, logger, pi, nominatingInfo)
 	npm.nLock.Unlock()
 }
 
-func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi *framework.PodInfo, nominatingInfo *framework.NominatingInfo) {
+func (npm *nominator) addNominatedPodUnlocked(ctx context.Context, logger klog.Logger, pi *framework.PodInfo, nominatingInfo *framework.NominatingInfo) {
 	// Always delete the pod if it already exists, to ensure we never store more than
 	// one instance of the pod.
 	npm.deleteUnlocked(pi.Pod)
@@ -85,11 +118,29 @@ func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi *framework.
 		nodeName = pi.Pod.Status.NominatedNodeName
 	}
 
-	if npm.podLister != nil {
+	//if npm.podLister != nil {
+	//	// If the pod was removed or if it was already scheduled, don't nominate it.
+	//	updatedPod, err := npm.podLister.Pods(pi.Pod.Namespace).Get(pi.Pod.Name)
+	//	if err != nil {
+	//		logger.V(4).Info("Pod doesn't exist in podLister, aborted adding it to the nominator", "pod", klog.KObj(pi.Pod))
+	//		return
+	//	}
+	//	if updatedPod.Spec.NodeName != "" {
+	//		logger.V(4).Info("Pod is already scheduled to a node, aborted adding it to the nominator", "pod", klog.KObj(pi.Pod), "node", updatedPod.Spec.NodeName)
+	//		return
+	//	}
+	//}
+	// --- Start of new logic ---
+	if npm.client != nil {
 		// If the pod was removed or if it was already scheduled, don't nominate it.
-		updatedPod, err := npm.podLister.Pods(pi.Pod.Namespace).Get(pi.Pod.Name)
+		// We now use the client for a direct API call.
+		updatedPod, err := npm.client.CoreV1().Pods(pi.Pod.Namespace).Get(ctx, pi.Pod.Name, metav1.GetOptions{})
 		if err != nil {
-			logger.V(4).Info("Pod doesn't exist in podLister, aborted adding it to the nominator", "pod", klog.KObj(pi.Pod))
+			if apierrors.IsNotFound(err) {
+				logger.V(4).Info("Pod doesn't exist in API server, aborted adding it to the nominator", "pod", klog.KObj(pi.Pod))
+			} else {
+				logger.Error(err, "Error getting pod from API server", "pod", klog.KObj(pi.Pod))
+			}
 			return
 		}
 		if updatedPod.Spec.NodeName != "" {
@@ -97,19 +148,24 @@ func (npm *nominator) addNominatedPodUnlocked(logger klog.Logger, pi *framework.
 			return
 		}
 	}
+	logger.V(4).Info("Adding pod to the nominator", "pod", klog.KObj(pi.Pod), "nominatedNodeName", nodeName)
+	// --- End of new logic ---
 
-	npm.nominatedPodToNode[pi.Pod.UID] = nodeName
-	for _, np := range npm.nominatedPods[nodeName] {
-		if np.uid == pi.Pod.UID {
-			logger.V(4).Info("Pod already exists in the nominator", "pod", np.uid)
-			return
-		}
+	//npm.nominatedPodToNode[pi.Pod.UID] = nodeName
+	//for _, np := range npm.nominatedPods[nodeName] {
+	//	if np.uid == pi.Pod.UID {
+	//		logger.V(4).Info("Pod already exists in the nominator", "pod", np.uid)
+	//		return
+	//	}
+	//}
+	//npm.nominatedPods[nodeName] = append(npm.nominatedPods[nodeName], podToRef(pi.Pod))
+	if err := npm.store.Put(ctx, pi.Pod.UID, nodeName, awsstore.PodToRef(pi.Pod)); err != nil {
+		logger.Error(err, "Failed to persist nomination", "pod", klog.KObj(pi.Pod))
 	}
-	npm.nominatedPods[nodeName] = append(npm.nominatedPods[nodeName], podToRef(pi.Pod))
 }
 
 // UpdateNominatedPod updates the <oldPod> with <newPod>.
-func (npm *nominator) UpdateNominatedPod(logger klog.Logger, oldPod *v1.Pod, newPodInfo *framework.PodInfo) {
+func (npm *nominator) UpdateNominatedPod(ctx context.Context, logger klog.Logger, oldPod *v1.Pod, newPodInfo *framework.PodInfo) {
 	npm.nLock.Lock()
 	defer npm.nLock.Unlock()
 	// In some cases, an Update event with no "NominatedNode" present is received right
@@ -121,18 +177,18 @@ func (npm *nominator) UpdateNominatedPod(logger klog.Logger, oldPod *v1.Pod, new
 	// (2) NominatedNode info is updated
 	// (3) NominatedNode info is removed
 	if nominatedNodeName(oldPod) == "" && nominatedNodeName(newPodInfo.Pod) == "" {
-		if nnn, ok := npm.nominatedPodToNode[oldPod.UID]; ok {
+		if n, ok, _ := npm.store.GetNodeForUID(ctx, oldPod.UID); ok {
 			// This is the only case we should continue reserving the NominatedNode
 			nominatingInfo = &framework.NominatingInfo{
 				NominatingMode:    framework.ModeOverride,
-				NominatedNodeName: nnn,
+				NominatedNodeName: n,
 			}
 		}
 	}
 	// We update irrespective of the nominatedNodeName changed or not, to ensure
 	// that pod pointer is updated.
 	npm.deleteUnlocked(oldPod)
-	npm.addNominatedPodUnlocked(logger, newPodInfo, nominatingInfo)
+	npm.addNominatedPodUnlocked(ctx, logger, newPodInfo, nominatingInfo)
 }
 
 // DeleteNominatedPodIfExists deletes <pod> from nominatedPods.
@@ -143,26 +199,29 @@ func (npm *nominator) DeleteNominatedPodIfExists(pod *v1.Pod) {
 }
 
 func (npm *nominator) deleteUnlocked(p *v1.Pod) {
-	nnn, ok := npm.nominatedPodToNode[p.UID]
-	if !ok {
-		return
-	}
-	for i, np := range npm.nominatedPods[nnn] {
-		if np.uid == p.UID {
-			npm.nominatedPods[nnn] = append(npm.nominatedPods[nnn][:i], npm.nominatedPods[nnn][i+1:]...)
-			if len(npm.nominatedPods[nnn]) == 0 {
-				delete(npm.nominatedPods, nnn)
-			}
-			break
-		}
-	}
-	delete(npm.nominatedPodToNode, p.UID)
+	//nnn, ok := npm.nominatedPodToNode[p.UID]
+	//if !ok {
+	//	return
+	//}
+	//for i, np := range npm.nominatedPods[nnn] {
+	//	if np.uid == p.UID {
+	//		npm.nominatedPods[nnn] = append(npm.nominatedPods[nnn][:i], npm.nominatedPods[nnn][i+1:]...)
+	//		if len(npm.nominatedPods[nnn]) == 0 {
+	//			delete(npm.nominatedPods, nnn)
+	//		}
+	//		break
+	//	}
+	//}
+	//delete(npm.nominatedPodToNode, p.UID)
+	_ = npm.store.Delete(context.Background(), p.UID, "")
 }
 
-func (npm *nominator) nominatedPodsForNode(nodeName string) []podRef {
+func (npm *nominator) nominatedPodsForNode(nodeName string) []awsstore.PodRef {
 	npm.nLock.RLock()
 	defer npm.nLock.RUnlock()
-	return slices.Clone(npm.nominatedPods[nodeName])
+	//return slices.Clone(npm.nominatedPods[nodeName])
+	prs, _ := npm.store.ListByNode(context.TODO(), nodeName)
+	return prs
 }
 
 // nominatedNodeName returns nominated node name of a Pod.

@@ -172,17 +172,17 @@ func (pl *InterPodAffinity) PreScore(
 	}
 
 	for i := range state.podInfo.PreferredAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(&state.podInfo.PreferredAffinityTerms[i].AffinityTerm); err != nil {
+		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(pCtx, &state.podInfo.PreferredAffinityTerms[i].AffinityTerm); err != nil {
 			return framework.AsStatus(fmt.Errorf("updating PreferredAffinityTerms: %w", err))
 		}
 	}
 	for i := range state.podInfo.PreferredAntiAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(&state.podInfo.PreferredAntiAffinityTerms[i].AffinityTerm); err != nil {
+		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(pCtx, &state.podInfo.PreferredAntiAffinityTerms[i].AffinityTerm); err != nil {
 			return framework.AsStatus(fmt.Errorf("updating PreferredAntiAffinityTerms: %w", err))
 		}
 	}
 	logger := klog.FromContext(pCtx)
-	state.namespaceLabels = GetNamespaceLabelsSnapshot(logger, pod.Namespace, pl.nsLister)
+	state.namespaceLabels = GetNamespaceLabelsSnapshot(pCtx, logger, pod.Namespace, pl.client)
 
 	topoScores := make([]scoreMap, len(allNodes))
 	index := int32(-1)

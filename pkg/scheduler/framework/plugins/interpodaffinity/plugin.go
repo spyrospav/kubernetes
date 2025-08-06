@@ -19,11 +19,12 @@ package interpodaffinity
 import (
 	"context"
 	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	listersv1 "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
@@ -45,10 +46,11 @@ var _ framework.EnqueueExtensions = &InterPodAffinity{}
 
 // InterPodAffinity is a plugin that checks inter pod affinity
 type InterPodAffinity struct {
-	parallelizer              parallelize.Parallelizer
-	args                      config.InterPodAffinityArgs
-	sharedLister              framework.SharedLister
-	nsLister                  listersv1.NamespaceLister
+	parallelizer parallelize.Parallelizer
+	args         config.InterPodAffinityArgs
+	sharedLister framework.SharedLister
+	//nsLister                  listersv1.NamespaceLister
+	client                    kubernetes.Interface
 	enableSchedulingQueueHint bool
 }
 
@@ -95,10 +97,11 @@ func New(_ context.Context, plArgs runtime.Object, h framework.Handle, fts featu
 		return nil, err
 	}
 	pl := &InterPodAffinity{
-		parallelizer:              h.Parallelizer(),
-		args:                      args,
-		sharedLister:              h.SnapshotSharedLister(),
-		nsLister:                  h.SharedInformerFactory().Core().V1().Namespaces().Lister(),
+		parallelizer: h.Parallelizer(),
+		args:         args,
+		sharedLister: h.SnapshotSharedLister(),
+		//nsLister:                  h.SharedInformerFactory().Core().V1().Namespaces().Lister(),
+		client:                    h.ClientSet(),
 		enableSchedulingQueueHint: fts.EnableSchedulingQueueHint,
 	}
 
@@ -120,15 +123,20 @@ func getArgs(obj runtime.Object) (config.InterPodAffinityArgs, error) {
 // is set to Nothing()) or is Empty(), which means match everything. Therefore,
 // there when matching against this term, there is no need to lookup the existing
 // pod's namespace labels to match them against term's namespaceSelector explicitly.
-func (pl *InterPodAffinity) mergeAffinityTermNamespacesIfNotEmpty(at *framework.AffinityTerm) error {
+func (pl *InterPodAffinity) mergeAffinityTermNamespacesIfNotEmpty(ctx context.Context, at *framework.AffinityTerm) error {
 	if at.NamespaceSelector.Empty() {
 		return nil
 	}
-	ns, err := pl.nsLister.List(at.NamespaceSelector)
+	// Create ListOptions from the label selector to use in the API call.
+	opts := metav1.ListOptions{LabelSelector: at.NamespaceSelector.String()}
+
+	// Directly call the API server to list namespaces matching the selector.
+	nsList, err := pl.client.CoreV1().Namespaces().List(ctx, opts)
+	//ns, err := pl.nsLister.List(at.NamespaceSelector)
 	if err != nil {
 		return err
 	}
-	for _, n := range ns {
+	for _, n := range nsList.Items {
 		at.Namespaces.Insert(n.Name)
 	}
 	at.NamespaceSelector = labels.Nothing()
@@ -137,8 +145,10 @@ func (pl *InterPodAffinity) mergeAffinityTermNamespacesIfNotEmpty(at *framework.
 
 // GetNamespaceLabelsSnapshot returns a snapshot of the labels associated with
 // the namespace.
-func GetNamespaceLabelsSnapshot(logger klog.Logger, ns string, nsLister listersv1.NamespaceLister) (nsLabels labels.Set) {
-	podNS, err := nsLister.Get(ns)
+func GetNamespaceLabelsSnapshot(ctx context.Context, logger klog.Logger, ns string, client kubernetes.Interface) (nsLabels labels.Set) {
+	//podNS, err := nsLister.Get(ns)
+	// Direct API call to the API server
+	podNS, err := client.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
 	if err == nil {
 		// Create and return snapshot of the labels.
 		return labels.Merge(podNS.Labels, nil)

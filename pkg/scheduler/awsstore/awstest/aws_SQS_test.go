@@ -1,10 +1,10 @@
-package awsqueues_test
+package awstest
 
 import (
 	"context"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
-	"k8s.io/kubernetes/pkg/scheduler/awsqueues"
+	"k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"slices"
 	"testing"
 	"time"
@@ -61,7 +61,7 @@ func TestSQSFIFOWithinBucket(t *testing.T) {
 // Helpers
 ////////////////////////////////////////////////////////////////////////////////
 
-func setUpFreshSQS(t *testing.T, buckets int) (context.Context, *awsqueues.PriorityQueueAWS) {
+func setUpFreshSQS(t *testing.T, buckets int) (context.Context, *awsstore.PriorityQueueAWS) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -75,8 +75,8 @@ func setUpFreshSQS(t *testing.T, buckets int) (context.Context, *awsqueues.Prior
 		_, _ = sqsCli.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: aws.String(url)})
 	}
 
-	pq, err := awsqueues.NewPriorityQueueAWS(ctx, awsCfg, awsqueues.Config{
-		Backend:     awsqueues.BackendSQS,
+	pq, err := awsstore.NewPriorityQueueAWS(ctx, awsCfg, awsstore.Config{
+		Backend:     awsstore.BackendSQS,
 		QueuePrefix: queuePrefix,
 		NumBuckets:  buckets,
 	}, nil, []func(*sqs.Options){localOpt})

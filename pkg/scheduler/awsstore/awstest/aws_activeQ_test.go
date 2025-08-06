@@ -1,4 +1,4 @@
-package awsqueues_test
+package awstest
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	awsqueues "k8s.io/kubernetes/pkg/scheduler/awsqueues"
+	awsqueues "k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 

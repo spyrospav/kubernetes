@@ -1,4 +1,4 @@
-package awsqueues_test
+package awstest
 
 import (
 	"context"

@@ -114,6 +114,7 @@ type Cache interface {
 
 	// Dump produces a dump of the current cache.
 	Dump() *Dump
+	Snapshot() *Snapshot
 }
 
 // Dump is a dump of the cache state.

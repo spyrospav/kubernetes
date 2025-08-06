@@ -21,9 +21,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"math/rand"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
-	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -431,7 +430,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		}, nil
 	}
 
-	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
+	priorityList, err := prioritizeNodes(ctx, fwk, state, pod, feasibleNodes)
 	if err != nil {
 		return result, err
 	}
@@ -454,10 +453,46 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 		NodeToStatus: framework.NewDefaultNodeToStatus(),
 	}
 
-	allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
+	// --- Start of new logic ---
+	// 1. List all nodes from the API server
+	nodeList, err := sched.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, diagnosis, err
+		return nil, diagnosis, fmt.Errorf("failed to list nodes: %w", err)
 	}
+
+	// 2. List all pods from all namespaces from the API server
+	podList, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, diagnosis, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// 3. Group pods by the node they are assigned to
+	podsByNode := make(map[string][]*v1.Pod)
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		// We only care about pods that are actually assigned to a node
+		if pod.Spec.NodeName != "" {
+			podsByNode[pod.Spec.NodeName] = append(podsByNode[pod.Spec.NodeName], pod)
+		}
+	}
+
+	// 4. Build complete NodeInfo objects, now including the pods
+	allNodes := make([]*framework.NodeInfo, 0, len(nodeList.Items))
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		// Create the NodeInfo, passing the list of pods for that node
+		nodeInfo := framework.NewNodeInfo(podsByNode[node.Name]...)
+		nodeInfo.SetNode(node)
+		allNodes = append(allNodes, nodeInfo)
+	}
+
+	logger.V(4).Info("All nodes with their pods have been collected", "nodeCount", len(allNodes))
+	// --- End of new logic ---
+
+	//allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
+	//if err != nil {
+	//	return nil, diagnosis, err
+	//}
 	// Run "prefilter" plugins.
 	preRes, s, unscheduledPlugins := fwk.RunPreFilterPlugins(ctx, state, pod)
 	diagnosis.UnschedulablePlugins = unscheduledPlugins
@@ -510,26 +545,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 		return nil, diagnosis, err
 	}
 
-	feasibleNodesAfterExtender, err := findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatus)
-	if err != nil {
-		return nil, diagnosis, err
-	}
-	if len(feasibleNodesAfterExtender) != len(feasibleNodes) {
-		// Extenders filtered out some nodes.
-		//
-		// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.
-		// When Extenders reject some Nodes and the pod ends up being unschedulable,
-		// we put framework.ExtenderName to pInfo.UnschedulablePlugins.
-		// This Pod will be requeued from unschedulable pod pool to activeQ/backoffQ
-		// by any kind of cluster events.
-		// https://github.com/kubernetes/kubernetes/issues/122019
-		if diagnosis.UnschedulablePlugins == nil {
-			diagnosis.UnschedulablePlugins = sets.New[string]()
-		}
-		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
-	}
-
-	return feasibleNodesAfterExtender, diagnosis, nil
+	return feasibleNodes, diagnosis, nil
 }
 
 func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, fwk framework.Framework, state *framework.CycleState, diagnosis framework.Diagnosis) ([]*framework.NodeInfo, error) {
@@ -544,11 +560,6 @@ func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, 
 		return nil, err
 	}
 
-	feasibleNodes, err = findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatus)
-	if err != nil {
-		return nil, err
-	}
-
 	return feasibleNodes, nil
 }
 
@@ -557,21 +568,11 @@ func (sched *Scheduler) hasScoring(fwk framework.Framework) bool {
 	if fwk.HasScorePlugins() {
 		return true
 	}
-	for _, extender := range sched.Extenders {
-		if extender.IsPrioritizer() {
-			return true
-		}
-	}
 	return false
 }
 
 // hasExtenderFilters checks if any extenders filter nodes.
 func (sched *Scheduler) hasExtenderFilters() bool {
-	for _, extender := range sched.Extenders {
-		if extender.IsFilter() {
-			return true
-		}
-	}
 	return false
 }
 
@@ -689,52 +690,6 @@ func (sched *Scheduler) numFeasibleNodesToFind(percentageOfNodesToScore *int32, 
 	return numNodes
 }
 
-func findNodesThatPassExtenders(ctx context.Context, extenders []framework.Extender, pod *v1.Pod, feasibleNodes []*framework.NodeInfo, statuses *framework.NodeToStatus) ([]*framework.NodeInfo, error) {
-	logger := klog.FromContext(ctx)
-
-	// Extenders are called sequentially.
-	// Nodes in original feasibleNodes can be excluded in one extender, and pass on to the next
-	// extender in a decreasing manner.
-	for _, extender := range extenders {
-		if len(feasibleNodes) == 0 {
-			break
-		}
-		if !extender.IsInterested(pod) {
-			continue
-		}
-
-		// Status of failed nodes in failedAndUnresolvableMap will be added to <statuses>,
-		// so that the scheduler framework can respect the UnschedulableAndUnresolvable status for
-		// particular nodes, and this may eventually improve preemption efficiency.
-		// Note: users are recommended to configure the extenders that may return UnschedulableAndUnresolvable
-		// status ahead of others.
-		feasibleList, failedMap, failedAndUnresolvableMap, err := extender.Filter(pod, feasibleNodes)
-		if err != nil {
-			if extender.IsIgnorable() {
-				logger.Info("Skipping extender as it returned error and has ignorable flag set", "extender", extender, "err", err)
-				continue
-			}
-			return nil, err
-		}
-
-		for failedNodeName, failedMsg := range failedAndUnresolvableMap {
-			statuses.Set(failedNodeName, framework.NewStatus(framework.UnschedulableAndUnresolvable, failedMsg))
-		}
-
-		for failedNodeName, failedMsg := range failedMap {
-			if _, found := failedAndUnresolvableMap[failedNodeName]; found {
-				// failedAndUnresolvableMap takes precedence over failedMap
-				// note that this only happens if the extender returns the node in both maps
-				continue
-			}
-			statuses.Set(failedNodeName, framework.NewStatus(framework.Unschedulable, failedMsg))
-		}
-
-		feasibleNodes = feasibleList
-	}
-	return feasibleNodes, nil
-}
-
 // prioritizeNodes prioritizes the nodes by running the score plugins,
 // which return a score for each node from the call to RunScorePlugins().
 // The scores from each plugin are added together to make the score for that node, then
@@ -742,7 +697,7 @@ func findNodesThatPassExtenders(ctx context.Context, extenders []framework.Exten
 // All scores are finally combined (added) to get the total weighted scores of all nodes
 func prioritizeNodes(
 	ctx context.Context,
-	extenders []framework.Extender,
+	//extenders []framework.Extender,
 	fwk framework.Framework,
 	state *framework.CycleState,
 	pod *v1.Pod,
@@ -751,7 +706,7 @@ func prioritizeNodes(
 	logger := klog.FromContext(ctx)
 	// If no priority configs are provided, then all nodes will have a score of one.
 	// This is required to generate the priority list in the required format
-	if len(extenders) == 0 && !fwk.HasScorePlugins() {
+	if !fwk.HasScorePlugins() {
 		result := make([]framework.NodePluginScores, 0, len(nodes))
 		for i := range nodes {
 			result = append(result, framework.NodePluginScores{
@@ -780,66 +735,6 @@ func prioritizeNodes(
 		for _, nodeScore := range nodesScores {
 			for _, pluginScore := range nodeScore.Scores {
 				loggerVTen.Info("Plugin scored node for pod", "pod", klog.KObj(pod), "plugin", pluginScore.Name, "node", nodeScore.Name, "score", pluginScore.Score)
-			}
-		}
-	}
-
-	if len(extenders) != 0 && nodes != nil {
-		// allNodeExtendersScores has all extenders scores for all nodes.
-		// It is keyed with node name.
-		allNodeExtendersScores := make(map[string]*framework.NodePluginScores, len(nodes))
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		for i := range extenders {
-			if !extenders[i].IsInterested(pod) {
-				continue
-			}
-			wg.Add(1)
-			go func(extIndex int) {
-				metrics.Goroutines.WithLabelValues(metrics.PrioritizingExtender).Inc()
-				defer func() {
-					metrics.Goroutines.WithLabelValues(metrics.PrioritizingExtender).Dec()
-					wg.Done()
-				}()
-				prioritizedList, weight, err := extenders[extIndex].Prioritize(pod, nodes)
-				if err != nil {
-					// Prioritization errors from extender can be ignored, let k8s/other extenders determine the priorities
-					logger.V(5).Info("Failed to run extender's priority function. No score given by this extender.", "error", err, "pod", klog.KObj(pod), "extender", extenders[extIndex].Name())
-					return
-				}
-				mu.Lock()
-				defer mu.Unlock()
-				for i := range *prioritizedList {
-					nodename := (*prioritizedList)[i].Host
-					score := (*prioritizedList)[i].Score
-					if loggerVTen.Enabled() {
-						loggerVTen.Info("Extender scored node for pod", "pod", klog.KObj(pod), "extender", extenders[extIndex].Name(), "node", nodename, "score", score)
-					}
-
-					// MaxExtenderPriority may diverge from the max priority used in the scheduler and defined by MaxNodeScore,
-					// therefore we need to scale the score returned by extenders to the score range used by the scheduler.
-					finalscore := score * weight * (framework.MaxNodeScore / extenderv1.MaxExtenderPriority)
-
-					if allNodeExtendersScores[nodename] == nil {
-						allNodeExtendersScores[nodename] = &framework.NodePluginScores{
-							Name:   nodename,
-							Scores: make([]framework.PluginScore, 0, len(extenders)),
-						}
-					}
-					allNodeExtendersScores[nodename].Scores = append(allNodeExtendersScores[nodename].Scores, framework.PluginScore{
-						Name:  extenders[extIndex].Name(),
-						Score: finalscore,
-					})
-					allNodeExtendersScores[nodename].TotalScore += finalscore
-				}
-			}(i)
-		}
-		// wait for all go routines to finish
-		wg.Wait()
-		for i := range nodesScores {
-			if score, ok := allNodeExtendersScores[nodes[i].Node().Name]; ok {
-				nodesScores[i].Scores = append(nodesScores[i].Scores, score.Scores...)
-				nodesScores[i].TotalScore += score.TotalScore
 			}
 		}
 	}
@@ -968,20 +863,6 @@ func (sched *Scheduler) bind(ctx context.Context, fwk framework.Framework, assum
 
 // TODO(#87159): Move this to a Plugin.
 func (sched *Scheduler) extendersBinding(logger klog.Logger, pod *v1.Pod, node string) (bool, error) {
-	for _, extender := range sched.Extenders {
-		if !extender.IsBinder() || !extender.IsInterested(pod) {
-			continue
-		}
-		err := extender.Bind(&v1.Binding{
-			ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
-			Target:     v1.ObjectReference{Kind: "Node", Name: node},
-		})
-		if err != nil && extender.IsIgnorable() {
-			logger.Info("Skipping extender in bind as it returned error and has ignorable flag set", "extender", extender, "err", err)
-			continue
-		}
-		return true, err
-	}
 	return false, nil
 }
 
@@ -1046,36 +927,63 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, fwk framewo
 		logger.Error(err, "Error scheduling pod; retrying", "pod", klog.KObj(pod))
 	}
 
-	// Check if the Pod exists in informer cache.
-	podLister := fwk.SharedInformerFactory().Core().V1().Pods().Lister()
-	cachedPod, e := podLister.Pods(pod.Namespace).Get(pod.Name)
+	//// Check if the Pod exists in informer cache.
+	//podLister := fwk.SharedInformerFactory().Core().V1().Pods().Lister()
+	//cachedPod, e := podLister.Pods(pod.Namespace).Get(pod.Name)
+	//if e != nil {
+	//	logger.Info("Pod doesn't exist in informer cache", "pod", klog.KObj(pod), "err", e)
+	//	// We need to call DonePod here because we don't call AddUnschedulableIfNotPresent in this case.
+	//} else {
+	//	// In the case of extender, the pod may have been bound successfully, but timed out returning its response to the scheduler.
+	//	// It could result in the live version to carry .spec.nodeName, and that's inconsistent with the internal-queued version.
+	//	if len(cachedPod.Spec.NodeName) != 0 {
+	//		logger.Info("Pod has been assigned to node. Abort adding it back to queue.", "pod", klog.KObj(pod), "node", cachedPod.Spec.NodeName)
+	//		// We need to call DonePod here because we don't call AddUnschedulableIfNotPresent in this case.
+	//	} else {
+	//		// As <cachedPod> is from SharedInformer, we need to do a DeepCopy() here.
+	//		// ignore this err since apiserver doesn't properly validate affinity terms
+	//		// and we can't fix the validation for backwards compatibility.
+	//		podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
+	//		if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(logger, podInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
+	//			logger.Error(err, "Error occurred")
+	//		}
+	//		calledDone = true
+	//	}
+	//}
+	// --- Start of new logic ---
+	// Check if the Pod exists in the API server.
+	cachedPod, e := sched.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if e != nil {
-		logger.Info("Pod doesn't exist in informer cache", "pod", klog.KObj(pod), "err", e)
+		// If the pod is not found, it means it was deleted from the API server.
+		if apierrors.IsNotFound(e) {
+			logger.Info("Pod doesn't exist in API server", "pod", klog.KObj(pod), "err", e)
+		} else {
+			logger.Error(e, "Error getting pod from API server", "pod", klog.KObj(pod))
+		}
 		// We need to call DonePod here because we don't call AddUnschedulableIfNotPresent in this case.
 	} else {
-		// In the case of extender, the pod may have been bound successfully, but timed out returning its response to the scheduler.
+		// In the case of an extender, the pod may have been bound successfully, but timed out returning its response to the scheduler.
 		// It could result in the live version to carry .spec.nodeName, and that's inconsistent with the internal-queued version.
 		if len(cachedPod.Spec.NodeName) != 0 {
-			logger.Info("Pod has been assigned to node. Abort adding it back to queue.", "pod", klog.KObj(pod), "node", cachedPod.Spec.NodeName)
+			logger.Info("Pod has been assigned to a node. Abort adding it back to the queue.", "pod", klog.KObj(pod), "node", cachedPod.Spec.NodeName)
 			// We need to call DonePod here because we don't call AddUnschedulableIfNotPresent in this case.
 		} else {
-			// As <cachedPod> is from SharedInformer, we need to do a DeepCopy() here.
-			// ignore this err since apiserver doesn't properly validate affinity terms
-			// and we can't fix the validation for backwards compatibility.
-			podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
+			// The pod object from the API server is a new copy, so we can use it directly.
+			podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod)
 			if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(logger, podInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
-				logger.Error(err, "Error occurred")
+				logger.Error(err, "Error adding pod back to the unschedulable queue", "pod", klog.KObj(pod))
 			}
 			calledDone = true
 		}
 	}
+	// --- End of new logic ---
 
 	// Update the scheduling queue with the nominated pod information. Without
 	// this, there would be a race condition between the next scheduling cycle
 	// and the time the scheduler receives a Pod Update for the nominated pod.
 	// Here we check for nil only for tests.
 	if sched.SchedulingQueue != nil {
-		sched.SchedulingQueue.AddNominatedPod(logger, podInfo.PodInfo, nominatingInfo)
+		sched.SchedulingQueue.AddNominatedPod(ctx, logger, podInfo.PodInfo, nominatingInfo)
 	}
 
 	if err == nil {

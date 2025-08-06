@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -28,12 +30,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	corelisters "k8s.io/client-go/listers/core/v1"
-	policylisters "k8s.io/client-go/listers/policy/v1"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -127,8 +126,9 @@ type Interface interface {
 type Evaluator struct {
 	PluginName string
 	Handler    framework.Handle
-	PodLister  corelisters.PodLister
-	PdbLister  policylisters.PodDisruptionBudgetLister
+	//PodLister  corelisters.PodLister
+	//PdbLister policylisters.PodDisruptionBudgetLister
+	client kubernetes.Interface
 
 	enableAsyncPreemption bool
 	mu                    sync.RWMutex
@@ -144,14 +144,15 @@ type Evaluator struct {
 }
 
 func NewEvaluator(pluginName string, fh framework.Handle, i Interface, enableAsyncPreemption bool) *Evaluator {
-	podLister := fh.SharedInformerFactory().Core().V1().Pods().Lister()
-	pdbLister := fh.SharedInformerFactory().Policy().V1().PodDisruptionBudgets().Lister()
+	//podLister := fh.SharedInformerFactory().Core().V1().Pods().Lister()
+	//pdbLister := fh.SharedInformerFactory().Policy().V1().PodDisruptionBudgets().Lister()
 
 	ev := &Evaluator{
-		PluginName:            pluginName,
-		Handler:               fh,
-		PodLister:             podLister,
-		PdbLister:             pdbLister,
+		PluginName: pluginName,
+		Handler:    fh,
+		//PodLister:             podLister,
+		//PdbLister:             pdbLister,
+		client:                fh.ClientSet(),
 		Interface:             i,
 		enableAsyncPreemption: enableAsyncPreemption,
 		preempting:            sets.New[types.UID](),
@@ -236,7 +237,8 @@ func (ev *Evaluator) Preempt(ctx context.Context, state *framework.CycleState, p
 	// initialized when creating the Scheduler obj.
 	// However, tests may need to manually initialize the shared pod informer.
 	podNamespace, podName := pod.Namespace, pod.Name
-	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+	//pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+	pod, err := ev.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil {
 		logger.Error(err, "Could not get the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
 		return nil, framework.AsStatus(err)
@@ -323,7 +325,7 @@ func (ev *Evaluator) findCandidates(ctx context.Context, state *framework.CycleS
 		return nil, framework.NewDefaultNodeToStatus(), nil
 	}
 
-	pdbs, err := getPodDisruptionBudgets(ev.PdbLister)
+	pdbs, err := getPodDisruptionBudgets(ctx, ev.client)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -546,11 +548,23 @@ func (ev *Evaluator) prepareCandidateAsync(c Candidate, pod *v1.Pod, pluginName 
 	}()
 }
 
-func getPodDisruptionBudgets(pdbLister policylisters.PodDisruptionBudgetLister) ([]*policy.PodDisruptionBudget, error) {
-	if pdbLister != nil {
-		return pdbLister.List(labels.Everything())
+func getPodDisruptionBudgets(ctx context.Context, client kubernetes.Interface) ([]*policy.PodDisruptionBudget, error) {
+	if client == nil {
+		return nil, nil
 	}
-	return nil, nil
+
+	// Directly call the API server to list all PDBs in the cluster
+	pdbList, err := client.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert the list of PDBs to a slice of pointers
+	pdbs := make([]*policy.PodDisruptionBudget, len(pdbList.Items))
+	for i := range pdbList.Items {
+		pdbs[i] = &pdbList.Items[i]
+	}
+	return pdbs, nil
 }
 
 // pickOneNodeForPreemption chooses one node among the given nodes.

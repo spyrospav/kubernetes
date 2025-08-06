@@ -17,23 +17,15 @@ limitations under the License.
 package scheduler
 
 import (
-	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	corev1nodeaffinity "k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
-	resourceslicetracker "k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/backend/queue"
@@ -44,7 +36,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
-	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
 )
 
 func (sched *Scheduler) addNodeToCache(obj interface{}) {
@@ -347,277 +338,277 @@ const (
 	syncedPollPeriod = 100 * time.Millisecond
 )
 
-// WaitForHandlersSync waits for EventHandlers to sync.
-// It returns true if it was successful, false if the controller should shut down
-func (sched *Scheduler) WaitForHandlersSync(ctx context.Context) error {
-	return wait.PollUntilContextCancel(ctx, syncedPollPeriod, true, func(ctx context.Context) (done bool, err error) {
-		for _, handler := range sched.registeredHandlers {
-			if !handler.HasSynced() {
-				return false, nil
-			}
-		}
-		return true, nil
-	})
-}
+//// WaitForHandlersSync waits for EventHandlers to sync.
+//// It returns true if it was successful, false if the controller should shut down
+//func (sched *Scheduler) WaitForHandlersSync(ctx context.Context) error {
+//	return wait.PollUntilContextCancel(ctx, syncedPollPeriod, true, func(ctx context.Context) (done bool, err error) {
+//		for _, handler := range sched.registeredHandlers {
+//			if !handler.HasSynced() {
+//				return false, nil
+//			}
+//		}
+//		return true, nil
+//	})
+//}
 
-// addAllEventHandlers is a helper function used in tests and in Scheduler
-// to add event handlers for various informers.
-func addAllEventHandlers(
-	sched *Scheduler,
-	informerFactory informers.SharedInformerFactory,
-	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
-	resourceClaimCache *assumecache.AssumeCache,
-	resourceSliceTracker *resourceslicetracker.Tracker,
-	gvkMap map[framework.EventResource]framework.ActionType,
-) error {
-	var (
-		handlerRegistration cache.ResourceEventHandlerRegistration
-		err                 error
-		handlers            []cache.ResourceEventHandlerRegistration
-	)
-	// scheduled pod cache
-	if handlerRegistration, err = informerFactory.Core().V1().Pods().Informer().AddEventHandler(
-		cache.FilteringResourceEventHandler{
-			FilterFunc: func(obj interface{}) bool {
-				switch t := obj.(type) {
-				case *v1.Pod:
-					return assignedPod(t)
-				case cache.DeletedFinalStateUnknown:
-					if _, ok := t.Obj.(*v1.Pod); ok {
-						// The carried object may be stale, so we don't use it to check if
-						// it's assigned or not. Attempting to cleanup anyways.
-						return true
-					}
-					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
-					return false
-				default:
-					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
-					return false
-				}
-			},
-			Handler: cache.ResourceEventHandlerFuncs{
-				AddFunc:    sched.addPodToCache,
-				UpdateFunc: sched.updatePodInCache,
-				DeleteFunc: sched.deletePodFromCache,
-			},
-		},
-	); err != nil {
-		return err
-	}
-	handlers = append(handlers, handlerRegistration)
-
-	// unscheduled pod queue
-	if handlerRegistration, err = informerFactory.Core().V1().Pods().Informer().AddEventHandler(
-		cache.FilteringResourceEventHandler{
-			FilterFunc: func(obj interface{}) bool {
-				switch t := obj.(type) {
-				case *v1.Pod:
-					return !assignedPod(t) && responsibleForPod(t, sched.Profiles)
-				case cache.DeletedFinalStateUnknown:
-					if pod, ok := t.Obj.(*v1.Pod); ok {
-						// The carried object may be stale, so we don't use it to check if
-						// it's assigned or not.
-						return responsibleForPod(pod, sched.Profiles)
-					}
-					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
-					return false
-				default:
-					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
-					return false
-				}
-			},
-			Handler: cache.ResourceEventHandlerFuncs{
-				AddFunc:    sched.addPodToSchedulingQueue,
-				UpdateFunc: sched.updatePodInSchedulingQueue,
-				DeleteFunc: sched.deletePodFromSchedulingQueue,
-			},
-		},
-	); err != nil {
-		return err
-	}
-	handlers = append(handlers, handlerRegistration)
-
-	if handlerRegistration, err = informerFactory.Core().V1().Nodes().Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    sched.addNodeToCache,
-			UpdateFunc: sched.updateNodeInCache,
-			DeleteFunc: sched.deleteNodeFromCache,
-		},
-	); err != nil {
-		return err
-	}
-	handlers = append(handlers, handlerRegistration)
-
-	logger := sched.logger
-	buildEvtResHandler := func(at framework.ActionType, resource framework.EventResource) cache.ResourceEventHandlerFuncs {
-		funcs := cache.ResourceEventHandlerFuncs{}
-		if at&framework.Add != 0 {
-			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Add}
-			funcs.AddFunc = func(obj interface{}) {
-				start := time.Now()
-				defer metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
-				if resource == framework.StorageClass && !utilfeature.DefaultFeatureGate.Enabled(features.SchedulerQueueingHints) {
-					sc, ok := obj.(*storagev1.StorageClass)
-					if !ok {
-						logger.Error(nil, "Cannot convert to *storagev1.StorageClass", "obj", obj)
-						return
-					}
-
-					// CheckVolumeBindingPred fails if pod has unbound immediate PVCs. If these
-					// PVCs have specified StorageClass name, creating StorageClass objects
-					// with late binding will cause predicates to pass, so we need to move pods
-					// to active queue.
-					// We don't need to invalidate cached results because results will not be
-					// cached for pod that has unbound immediate PVCs.
-					if sc.VolumeBindingMode == nil || *sc.VolumeBindingMode != storagev1.VolumeBindingWaitForFirstConsumer {
-						return
-					}
-				}
-				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, nil, obj, nil)
-			}
-		}
-		if at&framework.Update != 0 {
-			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Update}
-			funcs.UpdateFunc = func(old, obj interface{}) {
-				start := time.Now()
-				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, old, obj, nil)
-				metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
-			}
-		}
-		if at&framework.Delete != 0 {
-			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Delete}
-			funcs.DeleteFunc = func(obj interface{}) {
-				start := time.Now()
-				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, obj, nil, nil)
-				metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
-			}
-		}
-		return funcs
-	}
-
-	for gvk, at := range gvkMap {
-		switch gvk {
-		case framework.Node, framework.Pod:
-			// Do nothing.
-		case framework.CSINode:
-			if handlerRegistration, err = informerFactory.Storage().V1().CSINodes().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.CSINode),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.CSIDriver:
-			if handlerRegistration, err = informerFactory.Storage().V1().CSIDrivers().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.CSIDriver),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.CSIStorageCapacity:
-			if handlerRegistration, err = informerFactory.Storage().V1().CSIStorageCapacities().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.CSIStorageCapacity),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.PersistentVolume:
-			// MaxPDVolumeCountPredicate: since it relies on the counts of PV.
-			//
-			// PvAdd: Pods created when there are no PVs available will be stuck in
-			// unschedulable queue. But unbound PVs created for static provisioning and
-			// delay binding storage class are skipped in PV controller dynamic
-			// provisioning and binding process, will not trigger events to schedule pod
-			// again. So we need to move pods to active queue on PV add for this
-			// scenario.
-			//
-			// PvUpdate: Scheduler.bindVolumesWorker may fail to update assumed pod volume
-			// bindings due to conflicts if PVs are updated by PV controller or other
-			// parties, then scheduler will add pod back to unschedulable queue. We
-			// need to move pods to active queue on PV update for this scenario.
-			if handlerRegistration, err = informerFactory.Core().V1().PersistentVolumes().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.PersistentVolume),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.PersistentVolumeClaim:
-			// MaxPDVolumeCountPredicate: add/update PVC will affect counts of PV when it is bound.
-			if handlerRegistration, err = informerFactory.Core().V1().PersistentVolumeClaims().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.PersistentVolumeClaim),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.ResourceClaim:
-			if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-				handlerRegistration = resourceClaimCache.AddEventHandler(
-					buildEvtResHandler(at, framework.ResourceClaim),
-				)
-				handlers = append(handlers, handlerRegistration)
-			}
-		case framework.ResourceSlice:
-			if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-				if handlerRegistration, err = resourceSliceTracker.AddEventHandler(
-					buildEvtResHandler(at, framework.ResourceSlice),
-				); err != nil {
-					return err
-				}
-				handlers = append(handlers, handlerRegistration)
-			}
-		case framework.DeviceClass:
-			if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-				if handlerRegistration, err = informerFactory.Resource().V1beta1().DeviceClasses().Informer().AddEventHandler(
-					buildEvtResHandler(at, framework.DeviceClass),
-				); err != nil {
-					return err
-				}
-				handlers = append(handlers, handlerRegistration)
-			}
-		case framework.StorageClass:
-			if handlerRegistration, err = informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.StorageClass),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		case framework.VolumeAttachment:
-			if handlerRegistration, err = informerFactory.Storage().V1().VolumeAttachments().Informer().AddEventHandler(
-				buildEvtResHandler(at, framework.VolumeAttachment),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		default:
-			// Tests may not instantiate dynInformerFactory.
-			if dynInformerFactory == nil {
-				continue
-			}
-			// GVK is expected to be at least 3-folded, separated by dots.
-			// <kind in plural>.<version>.<group>
-			// Valid examples:
-			// - foos.v1.example.com
-			// - bars.v1beta1.a.b.c
-			// Invalid examples:
-			// - foos.v1 (2 sections)
-			// - foo.v1.example.com (the first section should be plural)
-			if strings.Count(string(gvk), ".") < 2 {
-				logger.Error(nil, "incorrect event registration", "gvk", gvk)
-				continue
-			}
-			// Fall back to try dynamic informers.
-			gvr, _ := schema.ParseResourceArg(string(gvk))
-			dynInformer := dynInformerFactory.ForResource(*gvr).Informer()
-			if handlerRegistration, err = dynInformer.AddEventHandler(
-				buildEvtResHandler(at, gvk),
-			); err != nil {
-				return err
-			}
-			handlers = append(handlers, handlerRegistration)
-		}
-	}
-	sched.registeredHandlers = handlers
-	return nil
-}
+//// addAllEventHandlers is a helper function used in tests and in Scheduler
+//// to add event handlers for various informers.
+//func addAllEventHandlers(
+//	sched *Scheduler,
+//	informerFactory informers.SharedInformerFactory,
+//	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
+//	//resourceClaimCache *assumecache.AssumeCache,
+//	//resourceSliceTracker *resourceslicetracker.Tracker,
+//	gvkMap map[framework.EventResource]framework.ActionType,
+//) error {
+//	var (
+//		handlerRegistration cache.ResourceEventHandlerRegistration
+//		err                 error
+//		handlers            []cache.ResourceEventHandlerRegistration
+//	)
+//	// scheduled pod cache
+//	if handlerRegistration, err = informerFactory.Core().V1().Pods().Informer().AddEventHandler(
+//		cache.FilteringResourceEventHandler{
+//			FilterFunc: func(obj interface{}) bool {
+//				switch t := obj.(type) {
+//				case *v1.Pod:
+//					return assignedPod(t)
+//				case cache.DeletedFinalStateUnknown:
+//					if _, ok := t.Obj.(*v1.Pod); ok {
+//						// The carried object may be stale, so we don't use it to check if
+//						// it's assigned or not. Attempting to cleanup anyways.
+//						return true
+//					}
+//					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+//					return false
+//				default:
+//					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+//					return false
+//				}
+//			},
+//			Handler: cache.ResourceEventHandlerFuncs{
+//				AddFunc:    sched.addPodToCache,
+//				UpdateFunc: sched.updatePodInCache,
+//				DeleteFunc: sched.deletePodFromCache,
+//			},
+//		},
+//	); err != nil {
+//		return err
+//	}
+//	handlers = append(handlers, handlerRegistration)
+//
+//	// unscheduled pod queue
+//	if handlerRegistration, err = informerFactory.Core().V1().Pods().Informer().AddEventHandler(
+//		cache.FilteringResourceEventHandler{
+//			FilterFunc: func(obj interface{}) bool {
+//				switch t := obj.(type) {
+//				case *v1.Pod:
+//					return !assignedPod(t) && responsibleForPod(t, sched.Profiles)
+//				case cache.DeletedFinalStateUnknown:
+//					if pod, ok := t.Obj.(*v1.Pod); ok {
+//						// The carried object may be stale, so we don't use it to check if
+//						// it's assigned or not.
+//						return responsibleForPod(pod, sched.Profiles)
+//					}
+//					utilruntime.HandleError(fmt.Errorf("unable to convert object %T to *v1.Pod in %T", obj, sched))
+//					return false
+//				default:
+//					utilruntime.HandleError(fmt.Errorf("unable to handle object in %T: %T", sched, obj))
+//					return false
+//				}
+//			},
+//			Handler: cache.ResourceEventHandlerFuncs{
+//				AddFunc:    sched.addPodToSchedulingQueue,
+//				UpdateFunc: sched.updatePodInSchedulingQueue,
+//				DeleteFunc: sched.deletePodFromSchedulingQueue,
+//			},
+//		},
+//	); err != nil {
+//		return err
+//	}
+//	handlers = append(handlers, handlerRegistration)
+//
+//	if handlerRegistration, err = informerFactory.Core().V1().Nodes().Informer().AddEventHandler(
+//		cache.ResourceEventHandlerFuncs{
+//			AddFunc:    sched.addNodeToCache,
+//			UpdateFunc: sched.updateNodeInCache,
+//			DeleteFunc: sched.deleteNodeFromCache,
+//		},
+//	); err != nil {
+//		return err
+//	}
+//	handlers = append(handlers, handlerRegistration)
+//
+//	logger := sched.logger
+//	buildEvtResHandler := func(at framework.ActionType, resource framework.EventResource) cache.ResourceEventHandlerFuncs {
+//		funcs := cache.ResourceEventHandlerFuncs{}
+//		if at&framework.Add != 0 {
+//			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Add}
+//			funcs.AddFunc = func(obj interface{}) {
+//				start := time.Now()
+//				defer metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
+//				if resource == framework.StorageClass && !utilfeature.DefaultFeatureGate.Enabled(features.SchedulerQueueingHints) {
+//					sc, ok := obj.(*storagev1.StorageClass)
+//					if !ok {
+//						logger.Error(nil, "Cannot convert to *storagev1.StorageClass", "obj", obj)
+//						return
+//					}
+//
+//					// CheckVolumeBindingPred fails if pod has unbound immediate PVCs. If these
+//					// PVCs have specified StorageClass name, creating StorageClass objects
+//					// with late binding will cause predicates to pass, so we need to move pods
+//					// to active queue.
+//					// We don't need to invalidate cached results because results will not be
+//					// cached for pod that has unbound immediate PVCs.
+//					if sc.VolumeBindingMode == nil || *sc.VolumeBindingMode != storagev1.VolumeBindingWaitForFirstConsumer {
+//						return
+//					}
+//				}
+//				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, nil, obj, nil)
+//			}
+//		}
+//		if at&framework.Update != 0 {
+//			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Update}
+//			funcs.UpdateFunc = func(old, obj interface{}) {
+//				start := time.Now()
+//				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, old, obj, nil)
+//				metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
+//			}
+//		}
+//		if at&framework.Delete != 0 {
+//			evt := framework.ClusterEvent{Resource: resource, ActionType: framework.Delete}
+//			funcs.DeleteFunc = func(obj interface{}) {
+//				start := time.Now()
+//				sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, evt, obj, nil, nil)
+//				metrics.EventHandlingLatency.WithLabelValues(evt.Label()).Observe(metrics.SinceInSeconds(start))
+//			}
+//		}
+//		return funcs
+//	}
+//
+//	for gvk, at := range gvkMap {
+//		switch gvk {
+//		case framework.Node, framework.Pod:
+//			// Do nothing.
+//		case framework.CSINode:
+//			if handlerRegistration, err = informerFactory.Storage().V1().CSINodes().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.CSINode),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		case framework.CSIDriver:
+//			if handlerRegistration, err = informerFactory.Storage().V1().CSIDrivers().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.CSIDriver),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		case framework.CSIStorageCapacity:
+//			if handlerRegistration, err = informerFactory.Storage().V1().CSIStorageCapacities().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.CSIStorageCapacity),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		case framework.PersistentVolume:
+//			// MaxPDVolumeCountPredicate: since it relies on the counts of PV.
+//			//
+//			// PvAdd: Pods created when there are no PVs available will be stuck in
+//			// unschedulable queue. But unbound PVs created for static provisioning and
+//			// delay binding storage class are skipped in PV controller dynamic
+//			// provisioning and binding process, will not trigger events to schedule pod
+//			// again. So we need to move pods to active queue on PV add for this
+//			// scenario.
+//			//
+//			// PvUpdate: Scheduler.bindVolumesWorker may fail to update assumed pod volume
+//			// bindings due to conflicts if PVs are updated by PV controller or other
+//			// parties, then scheduler will add pod back to unschedulable queue. We
+//			// need to move pods to active queue on PV update for this scenario.
+//			if handlerRegistration, err = informerFactory.Core().V1().PersistentVolumes().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.PersistentVolume),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		case framework.PersistentVolumeClaim:
+//			// MaxPDVolumeCountPredicate: add/update PVC will affect counts of PV when it is bound.
+//			if handlerRegistration, err = informerFactory.Core().V1().PersistentVolumeClaims().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.PersistentVolumeClaim),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		//case framework.ResourceClaim:
+//		//	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+//		//		handlerRegistration = resourceClaimCache.AddEventHandler(
+//		//			buildEvtResHandler(at, framework.ResourceClaim),
+//		//		)
+//		//		handlers = append(handlers, handlerRegistration)
+//		//	}
+//		//case framework.ResourceSlice:
+//		//	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+//		//		if handlerRegistration, err = resourceSliceTracker.AddEventHandler(
+//		//			buildEvtResHandler(at, framework.ResourceSlice),
+//		//		); err != nil {
+//		//			return err
+//		//		}
+//		//		handlers = append(handlers, handlerRegistration)
+//		//	}
+//		case framework.DeviceClass:
+//			if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
+//				if handlerRegistration, err = informerFactory.Resource().V1beta1().DeviceClasses().Informer().AddEventHandler(
+//					buildEvtResHandler(at, framework.DeviceClass),
+//				); err != nil {
+//					return err
+//				}
+//				handlers = append(handlers, handlerRegistration)
+//			}
+//		case framework.StorageClass:
+//			if handlerRegistration, err = informerFactory.Storage().V1().StorageClasses().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.StorageClass),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		case framework.VolumeAttachment:
+//			if handlerRegistration, err = informerFactory.Storage().V1().VolumeAttachments().Informer().AddEventHandler(
+//				buildEvtResHandler(at, framework.VolumeAttachment),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		default:
+//			// Tests may not instantiate dynInformerFactory.
+//			if dynInformerFactory == nil {
+//				continue
+//			}
+//			// GVK is expected to be at least 3-folded, separated by dots.
+//			// <kind in plural>.<version>.<group>
+//			// Valid examples:
+//			// - foos.v1.example.com
+//			// - bars.v1beta1.a.b.c
+//			// Invalid examples:
+//			// - foos.v1 (2 sections)
+//			// - foo.v1.example.com (the first section should be plural)
+//			if strings.Count(string(gvk), ".") < 2 {
+//				logger.Error(nil, "incorrect event registration", "gvk", gvk)
+//				continue
+//			}
+//			// Fall back to try dynamic informers.
+//			gvr, _ := schema.ParseResourceArg(string(gvk))
+//			dynInformer := dynInformerFactory.ForResource(*gvr).Informer()
+//			if handlerRegistration, err = dynInformer.AddEventHandler(
+//				buildEvtResHandler(at, gvk),
+//			); err != nil {
+//				return err
+//			}
+//			handlers = append(handlers, handlerRegistration)
+//		}
+//	}
+//	sched.registeredHandlers = handlers
+//	return nil
+//}
 
 func preCheckForNode(nodeInfo *framework.NodeInfo) queue.PreEnqueueCheck {
 	if utilfeature.DefaultFeatureGate.Enabled(features.SchedulerQueueingHints) {

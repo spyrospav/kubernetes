@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"k8s.io/kubernetes/pkg/scheduler/awsqueues"
+	"k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"sync"
 	"time"
 
@@ -96,38 +96,14 @@ type backoffQueue struct {
 	// podBackoffQ is a heap ordered by backoff expiry. Pods which have completed backoff
 	// are popped from this heap before the scheduler looks at activeQ
 	//podBackoffQ *heap.Heap[*framework.QueuedPodInfo]
-	podBackoffQ awsqueues.PodQueue
+	podBackoffQ awsstore.PodQueue
 	// podErrorBackoffQ is a heap ordered by error backoff expiry. Pods which have completed backoff
 	// are popped from this heap before the scheduler looks at activeQ
 	//podErrorBackoffQ *heap.Heap[*framework.QueuedPodInfo]
-	podErrorBackoffQ awsqueues.PodQueue
+	podErrorBackoffQ awsstore.PodQueue
 
 	podInitialBackoff time.Duration
 	podMaxBackoff     time.Duration
-	// activeQLessFn is used as an eventual less function if two backoff times are equal,
-	// when the SchedulerPopFromBackoffQ feature is enabled.
-	activeQLessFn framework.LessFunc
-
-	// isPopFromBackoffQEnabled indicates whether the feature gate SchedulerPopFromBackoffQ is enabled.
-	isPopFromBackoffQEnabled bool
-}
-
-func newBackoffQueue(clock clock.WithTicker, podInitialBackoffDuration time.Duration, podMaxBackoffDuration time.Duration, activeQLessFn framework.LessFunc, popFromBackoffQEnabled bool) *backoffQueue {
-	bq := &backoffQueue{
-		clock:                    clock,
-		podInitialBackoff:        podInitialBackoffDuration,
-		podMaxBackoff:            podMaxBackoffDuration,
-		isPopFromBackoffQEnabled: popFromBackoffQEnabled,
-		activeQLessFn:            activeQLessFn,
-	}
-	podBackoffQLessFn := bq.lessBackoffCompleted
-	if popFromBackoffQEnabled {
-		podBackoffQLessFn = bq.lessBackoffCompletedWithPriority
-	}
-	bq.podBackoffQ = heap.NewWithRecorder(podInfoKeyFunc, podBackoffQLessFn, metrics.NewBackoffPodsRecorder())
-	bq.podErrorBackoffQ = heap.NewWithRecorder(podInfoKeyFunc, bq.lessBackoffCompleted, metrics.NewBackoffPodsRecorder())
-
-	return bq
 }
 
 // New function to create backoffQueue with backend choice
@@ -135,17 +111,13 @@ func newBackoffQueueWithBackend(
 	clock clock.WithTicker,
 	podInitialBackoffDuration time.Duration,
 	podMaxBackoffDuration time.Duration,
-	activeQLessFn framework.LessFunc,
-	popFromBackoffQEnabled bool,
 	useDynamo bool,
 	awsCfg aws.Config,
 ) *backoffQueue {
 	bq := &backoffQueue{
-		clock:                    clock,
-		podInitialBackoff:        podInitialBackoffDuration,
-		podMaxBackoff:            podMaxBackoffDuration,
-		isPopFromBackoffQEnabled: popFromBackoffQEnabled,
-		activeQLessFn:            activeQLessFn,
+		clock:             clock,
+		podInitialBackoff: podInitialBackoffDuration,
+		podMaxBackoff:     podMaxBackoffDuration,
 	}
 
 	if useDynamo {
@@ -158,16 +130,16 @@ func newBackoffQueueWithBackend(
 		}
 
 		// Main backoff queue with built-in sorting
-		backoffConfig := awsqueues.Config{
-			Backend:        awsqueues.BackendDynamoDB,
+		backoffConfig := awsstore.Config{
+			Backend:        awsstore.BackendDynamoDB,
 			TableName:      "scheduler-backoffq",
 			QueueID:        "backoffQ",
 			GetBackoffTime: bq.GetBackoffTimeFunc(),
-			LessFunc:       bq.GetLessFunc(popFromBackoffQEnabled),
-			PriorityAware:  popFromBackoffQEnabled,
+			LessFunc:       bq.GetLessFunc(),
+			PriorityAware:  false,
 		}
 
-		backoffPQ, err := awsqueues.NewPriorityQueueAWS(
+		backoffPQ, err := awsstore.NewPriorityQueueAWS(
 			ctx,
 			awsCfg,
 			backoffConfig,
@@ -176,19 +148,19 @@ func newBackoffQueueWithBackend(
 		if err != nil {
 			panic(fmt.Sprintf("failed to create backoffQ: %v", err))
 		}
-		bq.podBackoffQ = awsqueues.DDBPQ{Ctx: ctx, Aws: backoffPQ}
+		bq.podBackoffQ = awsstore.DDBPQ{Ctx: ctx, Aws: backoffPQ}
 
 		// Error backoff queue (always uses simple time sorting)
-		errorConfig := awsqueues.Config{
-			Backend:        awsqueues.BackendDynamoDB,
+		errorConfig := awsstore.Config{
+			Backend:        awsstore.BackendDynamoDB,
 			TableName:      "scheduler-error-backoffq",
 			QueueID:        "errorBackoffQ",
 			GetBackoffTime: bq.GetBackoffTimeFunc(),
-			LessFunc:       bq.GetLessFunc(false), // Always use simple sorting
-			PriorityAware:  false,                 // Error backoff queue does not use priority
+			LessFunc:       bq.GetLessFunc(), // Always use simple sorting
+			PriorityAware:  false,            // Error backoff queue does not use priority
 		}
 
-		errorBackoffPQ, err := awsqueues.NewPriorityQueueAWS(
+		errorBackoffPQ, err := awsstore.NewPriorityQueueAWS(
 			ctx,
 			awsCfg,
 			errorConfig,
@@ -197,37 +169,37 @@ func newBackoffQueueWithBackend(
 		if err != nil {
 			panic(fmt.Sprintf("failed to create errorBackoffQ: %v", err))
 		}
-		bq.podErrorBackoffQ = awsqueues.DDBPQ{Ctx: ctx, Aws: errorBackoffPQ}
+		bq.podErrorBackoffQ = awsstore.DDBPQ{Ctx: ctx, Aws: errorBackoffPQ}
 
 		klog.Infof("Initialized DynamoDB queues with scheduler's backoff functions")
 	} else {
 		// Original heap implementation (unchanged)
 		podBackoffQLessFn := bq.lessBackoffCompleted
-		if popFromBackoffQEnabled {
-			podBackoffQLessFn = bq.lessBackoffCompletedWithPriority
-		}
+		//if popFromBackoffQEnabled {
+		//	podBackoffQLessFn = bq.lessBackoffCompletedWithPriority
+		//}
 
 		backoffHeap := heap.NewWithRecorder(podInfoKeyFunc,
 			podBackoffQLessFn,
 			metrics.NewBackoffPodsRecorder())
-		bq.podBackoffQ = awsqueues.HeapPQ{H: backoffHeap}
+		bq.podBackoffQ = awsstore.HeapPQ{H: backoffHeap}
 
 		errorBackoffHeap := heap.NewWithRecorder(podInfoKeyFunc,
 			bq.lessBackoffCompleted,
 			metrics.NewBackoffPodsRecorder())
-		bq.podErrorBackoffQ = awsqueues.HeapPQ{H: errorBackoffHeap}
+		bq.podErrorBackoffQ = awsstore.HeapPQ{H: errorBackoffHeap}
 	}
 
 	return bq
 }
 
-func (bq *backoffQueue) GetBackoffTimeFunc() awsqueues.BackoffTimeFunc {
+func (bq *backoffQueue) GetBackoffTimeFunc() awsstore.BackoffTimeFunc {
 	return func(podInfo *framework.QueuedPodInfo) time.Time {
 		return bq.getBackoffTime(podInfo)
 	}
 }
 
-func (bq *backoffQueue) GetLessFunc(useWithPriority bool) awsqueues.LessFunc {
+func (bq *backoffQueue) GetLessFunc() awsstore.LessFunc {
 	// FIXME: Force to use the simple less function for simplicity.
 	//if useWithPriority {
 	//	return bq.lessBackoffCompletedWithPriority
@@ -248,10 +220,7 @@ func (bq *backoffQueue) podMaxBackoffDuration() time.Duration {
 // alignToWindow truncates the provided time to the podBackoffQ ordering window.
 // It returns the lowest possible timestamp in the window.
 func (bq *backoffQueue) alignToWindow(t time.Time) time.Time {
-	if !bq.isPopFromBackoffQEnabled {
-		return t
-	}
-	return t.Truncate(backoffQOrderingWindowDuration)
+	return t
 }
 
 // waitUntilAlignedWithOrderingWindow waits until the time reaches a multiple of backoffQOrderingWindowDuration.
@@ -301,11 +270,7 @@ func (bq *backoffQueue) waitUntilAlignedWithOrderingWindow(f func(), stopCh <-ch
 func (bq *backoffQueue) lessBackoffCompletedWithPriority(pInfo1, pInfo2 *framework.QueuedPodInfo) bool {
 	bo1 := bq.getBackoffTime(pInfo1)
 	bo2 := bq.getBackoffTime(pInfo2)
-	if !bo1.Equal(bo2) {
-		return bo1.Before(bo2)
-	}
-	// If the backoff time is the same, sort the pod in the same manner as activeQ does.
-	return bq.activeQLessFn(pInfo1, pInfo2)
+	return bo1.Before(bo2)
 }
 
 // lessBackoffCompleted is a less function of podErrorBackoffQ.
@@ -362,7 +327,7 @@ func (bq *backoffQueue) calculateBackoffDuration(podInfo *framework.QueuedPodInf
 	return duration
 }
 
-func (bq *backoffQueue) popAllBackoffCompletedWithQueue(logger klog.Logger, queue awsqueues.PodQueue) []*framework.QueuedPodInfo {
+func (bq *backoffQueue) popAllBackoffCompletedWithQueue(logger klog.Logger, queue awsstore.PodQueue) []*framework.QueuedPodInfo {
 	var poppedPods []*framework.QueuedPodInfo
 	for {
 		pInfo, ok := queue.Peek()

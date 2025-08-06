@@ -1,4 +1,4 @@
-package awsqueues
+package awsstore
 
 import (
 	"log"

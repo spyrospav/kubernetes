@@ -20,37 +20,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	resourceslicetracker "k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/klog/v2"
 	configv1 "k8s.io/kube-scheduler/config/v1"
-	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	cachedebugger "k8s.io/kubernetes/pkg/scheduler/backend/cache/debugger"
 	internalqueue "k8s.io/kubernetes/pkg/scheduler/backend/queue"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	frameworkplugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
-	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
 	"k8s.io/utils/clock"
 )
 
@@ -69,8 +63,6 @@ type Scheduler struct {
 	// It is expected that changes made via Cache will be observed
 	// by NodeLister and Algorithm.
 	Cache internalcache.Cache
-
-	Extenders []framework.Extender
 
 	// NextPod should be a function that blocks until the next pod
 	// is available. We don't use a channel for this, because scheduling
@@ -107,9 +99,6 @@ type Scheduler struct {
 	// otherwise logging functions will access a nil sink and
 	// panic.
 	logger klog.Logger
-
-	// registeredHandlers contains the registrations of all handlers. It's used to check if all handlers have finished syncing before the scheduling cycles start.
-	registeredHandlers []cache.ResourceEventHandlerRegistration
 }
 
 func (sched *Scheduler) applyDefaultHandlers() {
@@ -129,7 +118,6 @@ type schedulerOptions struct {
 	// Contains out-of-tree plugins to be merged with the in-tree registry.
 	frameworkOutOfTreeRegistry frameworkruntime.Registry
 	profiles                   []schedulerapi.KubeSchedulerProfile
-	extenders                  []schedulerapi.Extender
 	frameworkCapturer          FrameworkCapturer
 	parallelism                int32
 	applyDefaultProfile        bool
@@ -223,13 +211,6 @@ func WithPodMaxInUnschedulablePodsDuration(duration time.Duration) Option {
 	}
 }
 
-// WithExtenders sets extenders for the Scheduler
-func WithExtenders(e ...schedulerapi.Extender) Option {
-	return func(o *schedulerOptions) {
-		o.extenders = e
-	}
-}
-
 // WithClock sets clock for PriorityQueue, the default clock is clock.RealClock.
 func WithClock(clock clock.WithTicker) Option {
 	return func(o *schedulerOptions) {
@@ -264,8 +245,6 @@ var defaultSchedulerOptions = schedulerOptions{
 // New returns a Scheduler
 func New(ctx context.Context,
 	client clientset.Interface,
-	informerFactory informers.SharedInformerFactory,
-	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
 	recorderFactory profile.RecorderFactory,
 	opts ...Option) (*Scheduler, error) {
 
@@ -288,59 +267,23 @@ func New(ctx context.Context,
 	}
 
 	registry := frameworkplugins.NewInTreeRegistry()
-	if err := registry.Merge(options.frameworkOutOfTreeRegistry); err != nil {
-		return nil, err
-	}
 
 	metrics.Register()
 
-	extenders, err := buildExtenders(logger, options.extenders, options.profiles)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't build extenders: %w", err)
-	}
+	schedulerCache := internalcache.New(ctx, durationToExpireAssumedPod)
+	snap := schedulerCache.Snapshot()
 
-	podLister := informerFactory.Core().V1().Pods().Lister()
-	nodeLister := informerFactory.Core().V1().Nodes().Lister()
-
-	snapshot := internalcache.NewEmptySnapshot()
 	metricsRecorder := metrics.NewMetricsAsyncRecorder(1000, time.Second, stopEverything)
 	// waitingPods holds all the pods that are in the scheduler and waiting in the permit stage
 	waitingPods := frameworkruntime.NewWaitingPodsMap()
-
-	var resourceClaimCache *assumecache.AssumeCache
-	var resourceSliceTracker *resourceslicetracker.Tracker
-	var draManager framework.SharedDRAManager
-	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
-		resourceClaimInformer := informerFactory.Resource().V1beta1().ResourceClaims().Informer()
-		resourceClaimCache = assumecache.NewAssumeCache(logger, resourceClaimInformer, "ResourceClaim", "", nil)
-		resourceSliceTrackerOpts := resourceslicetracker.Options{
-			EnableDeviceTaints: utilfeature.DefaultFeatureGate.Enabled(features.DRADeviceTaints),
-			SliceInformer:      informerFactory.Resource().V1beta1().ResourceSlices(),
-			KubeClient:         client,
-		}
-		// If device taints are disabled, the additional informers are not needed and
-		// the tracker turns into a simple wrapper around the slice informer.
-		if resourceSliceTrackerOpts.EnableDeviceTaints {
-			resourceSliceTrackerOpts.TaintInformer = informerFactory.Resource().V1alpha3().DeviceTaintRules()
-			resourceSliceTrackerOpts.ClassInformer = informerFactory.Resource().V1beta1().DeviceClasses()
-		}
-		resourceSliceTracker, err = resourceslicetracker.StartTracker(ctx, resourceSliceTrackerOpts)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't start resource slice tracker: %w", err)
-		}
-		draManager = dynamicresources.NewDRAManager(ctx, resourceClaimCache, resourceSliceTracker, informerFactory)
-	}
 
 	profiles, err := profile.NewMap(ctx, options.profiles, registry, recorderFactory,
 		frameworkruntime.WithComponentConfigVersion(options.componentConfigVersion),
 		frameworkruntime.WithClientSet(client),
 		frameworkruntime.WithKubeConfig(options.kubeConfig),
-		frameworkruntime.WithInformerFactory(informerFactory),
-		frameworkruntime.WithSharedDRAManager(draManager),
-		frameworkruntime.WithSnapshotSharedLister(snapshot),
+		frameworkruntime.WithSnapshotSharedLister(snap),
 		frameworkruntime.WithCaptureProfile(frameworkruntime.CaptureProfile(options.frameworkCapturer)),
 		frameworkruntime.WithParallelism(int(options.parallelism)),
-		frameworkruntime.WithExtenders(extenders),
 		frameworkruntime.WithMetricsRecorder(metricsRecorder),
 		frameworkruntime.WithWaitingPods(waitingPods),
 	)
@@ -352,31 +295,13 @@ func New(ctx context.Context,
 		return nil, errors.New("at least one profile is required")
 	}
 
-	preEnqueuePluginMap := make(map[string][]framework.PreEnqueuePlugin)
-	queueingHintsPerProfile := make(internalqueue.QueueingHintMapPerProfile)
-	var returnErr error
-	for profileName, profile := range profiles {
-		preEnqueuePluginMap[profileName] = profile.PreEnqueuePlugins()
-		queueingHintsPerProfile[profileName], err = buildQueueingHintMap(ctx, profile.EnqueueExtensions())
-		if err != nil {
-			returnErr = errors.Join(returnErr, err)
-		}
-	}
-
-	if returnErr != nil {
-		return nil, returnErr
-	}
-
 	podQueue := internalqueue.NewSchedulingQueue(
 		profiles[options.profiles[0].SchedulerName].QueueSortFunc(),
-		informerFactory,
+		client,
 		internalqueue.WithClock(options.clock),
 		internalqueue.WithPodInitialBackoffDuration(time.Duration(options.podInitialBackoffSeconds)*time.Second),
 		internalqueue.WithPodMaxBackoffDuration(time.Duration(options.podMaxBackoffSeconds)*time.Second),
-		internalqueue.WithPodLister(podLister),
 		internalqueue.WithPodMaxInUnschedulablePodsDuration(options.podMaxInUnschedulablePodsDuration),
-		internalqueue.WithPreEnqueuePluginMap(preEnqueuePluginMap),
-		internalqueue.WithQueueingHintMapPerProfile(queueingHintsPerProfile),
 		internalqueue.WithPluginMetricsSamplePercent(pluginMetricsSamplePercent),
 		internalqueue.WithMetricsRecorder(*metricsRecorder),
 	)
@@ -386,18 +311,11 @@ func New(ctx context.Context,
 		fwk.SetPodActivator(podQueue)
 	}
 
-	schedulerCache := internalcache.New(ctx, durationToExpireAssumedPod)
-
-	// Setup cache debugger.
-	debugger := cachedebugger.New(nodeLister, podLister, schedulerCache, podQueue)
-	debugger.ListenForSignal(ctx)
-
 	sched := &Scheduler{
 		Cache:                    schedulerCache,
 		client:                   client,
-		nodeInfoSnapshot:         snapshot,
+		nodeInfoSnapshot:         snap,
 		percentageOfNodesToScore: options.percentageOfNodesToScore,
-		Extenders:                extenders,
 		StopEverything:           stopEverything,
 		SchedulingQueue:          podQueue,
 		Profiles:                 profiles,
@@ -406,92 +324,20 @@ func New(ctx context.Context,
 	sched.NextPod = podQueue.Pop
 	sched.applyDefaultHandlers()
 
-	if err = addAllEventHandlers(sched, informerFactory, dynInformerFactory, resourceClaimCache, resourceSliceTracker, unionedGVKs(queueingHintsPerProfile)); err != nil {
-		return nil, fmt.Errorf("adding event handlers: %w", err)
-	}
-
 	return sched, nil
-}
-
-// defaultQueueingHintFn is the default queueing hint function.
-// It always returns Queue as the queueing hint.
-var defaultQueueingHintFn = func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (framework.QueueingHint, error) {
-	return framework.Queue, nil
-}
-
-func buildQueueingHintMap(ctx context.Context, es []framework.EnqueueExtensions) (internalqueue.QueueingHintMap, error) {
-	queueingHintMap := make(internalqueue.QueueingHintMap)
-	var returnErr error
-	for _, e := range es {
-		events, err := e.EventsToRegister(ctx)
-		if err != nil {
-			returnErr = errors.Join(returnErr, err)
-		}
-
-		// This will happen when plugin registers with empty events, it's usually the case a pod
-		// will become reschedulable only for self-update, e.g. schedulingGates plugin, the pod
-		// will enter into the activeQ via priorityQueue.Update().
-		if len(events) == 0 {
-			continue
-		}
-
-		// Note: Rarely, a plugin implements EnqueueExtensions but returns nil.
-		// We treat it as: the plugin is not interested in any event, and hence pod failed by that plugin
-		// cannot be moved by any regular cluster event.
-		// So, we can just ignore such EventsToRegister here.
-
-		registerNodeAdded := false
-		registerNodeTaintUpdated := false
-		for _, event := range events {
-			fn := event.QueueingHintFn
-			if fn == nil || !utilfeature.DefaultFeatureGate.Enabled(features.SchedulerQueueingHints) {
-				fn = defaultQueueingHintFn
-			}
-
-			if event.Event.Resource == framework.Node {
-				if event.Event.ActionType&framework.Add != 0 {
-					registerNodeAdded = true
-				}
-				if event.Event.ActionType&framework.UpdateNodeTaint != 0 {
-					registerNodeTaintUpdated = true
-				}
-			}
-
-			queueingHintMap[event.Event] = append(queueingHintMap[event.Event], &internalqueue.QueueingHintFunction{
-				PluginName:     e.Name(),
-				QueueingHintFn: fn,
-			})
-		}
-		if registerNodeAdded && !registerNodeTaintUpdated {
-			// Temporally fix for the issue https://github.com/kubernetes/kubernetes/issues/109437
-			// NodeAdded QueueingHint isn't always called because of preCheck.
-			// It's definitely not something expected for plugin developers,
-			// and registering UpdateNodeTaint event is the only mitigation for now.
-			//
-			// So, here registers UpdateNodeTaint event for plugins that has NodeAdded event, but don't have UpdateNodeTaint event.
-			// It has a bad impact for the requeuing efficiency though, a lot better than some Pods being stuch in the
-			// unschedulable pod pool.
-			// This behavior will be removed when we remove the preCheck feature.
-			// See: https://github.com/kubernetes/kubernetes/issues/110175
-			queueingHintMap[framework.ClusterEvent{Resource: framework.Node, ActionType: framework.UpdateNodeTaint}] =
-				append(queueingHintMap[framework.ClusterEvent{Resource: framework.Node, ActionType: framework.UpdateNodeTaint}],
-					&internalqueue.QueueingHintFunction{
-						PluginName:     e.Name(),
-						QueueingHintFn: defaultQueueingHintFn,
-					},
-				)
-		}
-	}
-	if returnErr != nil {
-		return nil, returnErr
-	}
-	return queueingHintMap, nil
 }
 
 // Run begins watching and scheduling. It starts scheduling and blocked until the context is done.
 func (sched *Scheduler) Run(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	sched.SchedulingQueue.Run(logger)
+
+	// "Prime the pump" by running the polling loop once synchronously at startup.
+	// This ensures the cache is populated before the main scheduling loop begins.
+	sched.pollingLoop(ctx)
+
+	// Start the new polling loop in the background.
+	go wait.UntilWithContext(ctx, sched.pollingLoop, 5*time.Second)
 
 	// We need to start scheduleOne loop in a dedicated goroutine,
 	// because scheduleOne function hangs on getting the next item
@@ -511,6 +357,134 @@ func (sched *Scheduler) Run(ctx context.Context) {
 	}
 }
 
+func (sched *Scheduler) pollingLoop(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Starting cache reconciliation poll")
+
+	// --- 1. Fetch Current State from API Server ---
+	nodeList, err := sched.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		logger.Error(err, "Polling failed: cannot list nodes")
+		return
+	}
+	scheduledPodsList, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermNotEqualSelector("spec.nodeName", "").String(),
+	})
+	if err != nil {
+		logger.Error(err, "Polling failed: cannot list scheduled pods")
+		return
+	}
+	unscheduledPodsList, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", "").String(),
+	})
+	if err != nil {
+		logger.Error(err, "Polling failed: cannot list unscheduled pods")
+		return
+	}
+
+	// --- 2. Get Current State from Local Cache ---
+	if err := sched.Cache.UpdateSnapshot(logger, sched.nodeInfoSnapshot); err != nil {
+		logger.Error(err, "Polling failed: cannot update snapshot")
+		return
+	}
+	cachedNodeInfos, err := sched.nodeInfoSnapshot.NodeInfos().List()
+	if err != nil {
+		logger.Error(err, "Polling failed: cannot list nodes from snapshot")
+		return
+	}
+
+	// --- 3. Reconcile Nodes ---
+	apiNodesMap := make(map[string]*v1.Node)
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		apiNodesMap[node.Name] = node
+	}
+	cachedNodesMap := make(map[string]*v1.Node)
+	for _, nodeInfo := range cachedNodeInfos {
+		cachedNodesMap[nodeInfo.Node().Name] = nodeInfo.Node()
+	}
+
+	// Handle node additions and updates
+	for name, apiNode := range apiNodesMap {
+		if cachedNode, exists := cachedNodesMap[name]; !exists {
+			sched.Cache.AddNode(logger, apiNode)
+		} else if apiNode.ResourceVersion != cachedNode.ResourceVersion {
+			sched.Cache.UpdateNode(logger, cachedNode, apiNode)
+		}
+	}
+	// Handle node deletions
+	for name, cachedNode := range cachedNodesMap {
+		if _, exists := apiNodesMap[name]; !exists {
+			sched.Cache.RemoveNode(logger, cachedNode)
+		}
+	}
+
+	// --- 4. Reconcile Pods ---
+	apiPodsMap := make(map[types.UID]*v1.Pod)
+	for i := range scheduledPodsList.Items {
+		pod := &scheduledPodsList.Items[i]
+		apiPodsMap[pod.UID] = pod
+	}
+	cachedPodsMap := make(map[types.UID]*v1.Pod)
+	for _, nodeInfo := range cachedNodeInfos {
+		for _, podInfo := range nodeInfo.Pods {
+			cachedPodsMap[podInfo.Pod.UID] = podInfo.Pod
+		}
+	}
+
+	// Handle scheduled pod additions and updates
+	for uid, apiPod := range apiPodsMap {
+		if cachedPod, exists := cachedPodsMap[uid]; !exists {
+			// Pod is in API but not cache -> ADD
+			sched.Cache.AddPod(logger, apiPod)
+		} else {
+			// Pod is in both -> check if it needs an UPDATE
+			if apiPod.ResourceVersion != cachedPod.ResourceVersion {
+				sched.Cache.UpdatePod(logger, cachedPod, apiPod)
+			}
+		}
+	}
+	// Handle scheduled pod deletions
+	for uid, cachedPod := range cachedPodsMap {
+		if _, exists := apiPodsMap[uid]; !exists {
+			// Pod is in cache but not API -> DELETE
+			sched.Cache.RemovePod(logger, cachedPod)
+		}
+	}
+
+	// --- 5. Reconcile Scheduling Queue ---
+	pendingPods, _ := sched.SchedulingQueue.PendingPods()
+	apiUnscheduledPodsMap := make(map[types.UID]*v1.Pod)
+	for i := range unscheduledPodsList.Items {
+		pod := &unscheduledPodsList.Items[i]
+		apiUnscheduledPodsMap[pod.UID] = pod
+	}
+	queuePodsMap := make(map[types.UID]*v1.Pod)
+	for _, pod := range pendingPods {
+		queuePodsMap[pod.UID] = pod
+	}
+	// Handle Adds and Updates for unscheduled pods
+	for uid, apiPod := range apiUnscheduledPodsMap {
+		if queuePod, exists := queuePodsMap[uid]; !exists {
+			sched.SchedulingQueue.Add(logger, apiPod)
+		} else if apiPod.ResourceVersion != queuePod.ResourceVersion {
+			sched.SchedulingQueue.Update(logger, queuePod, apiPod)
+		}
+	}
+	// Handle Deletes for unscheduled pods
+	for uid, queuePod := range queuePodsMap {
+		if _, exists := apiUnscheduledPodsMap[uid]; !exists {
+			sched.SchedulingQueue.Delete(queuePod)
+		}
+	}
+
+	// --- 6. Periodically Re-evaluate Unschedulable Pods ---
+	event := framework.ClusterEvent{Resource: framework.WildCard, ActionType: framework.All}
+	sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, event, nil, nil, nil)
+
+	logger.V(4).Info("Cache reconciliation poll completed")
+}
+
 // NewInformerFactory creates a SharedInformerFactory and initializes a scheduler specific
 // in-place podInformer.
 func NewInformerFactory(cs clientset.Interface, resyncPeriod time.Duration) informers.SharedInformerFactory {
@@ -519,79 +493,7 @@ func NewInformerFactory(cs clientset.Interface, resyncPeriod time.Duration) info
 	return informerFactory
 }
 
-func buildExtenders(logger klog.Logger, extenders []schedulerapi.Extender, profiles []schedulerapi.KubeSchedulerProfile) ([]framework.Extender, error) {
-	var fExtenders []framework.Extender
-	if len(extenders) == 0 {
-		return nil, nil
-	}
-
-	var ignoredExtendedResources []string
-	var ignorableExtenders []framework.Extender
-	for i := range extenders {
-		logger.V(2).Info("Creating extender", "extender", extenders[i])
-		extender, err := NewHTTPExtender(&extenders[i])
-		if err != nil {
-			return nil, err
-		}
-		if !extender.IsIgnorable() {
-			fExtenders = append(fExtenders, extender)
-		} else {
-			ignorableExtenders = append(ignorableExtenders, extender)
-		}
-		for _, r := range extenders[i].ManagedResources {
-			if r.IgnoredByScheduler {
-				ignoredExtendedResources = append(ignoredExtendedResources, r.Name)
-			}
-		}
-	}
-	// place ignorable extenders to the tail of extenders
-	fExtenders = append(fExtenders, ignorableExtenders...)
-
-	// If there are any extended resources found from the Extenders, append them to the pluginConfig for each profile.
-	// This should only have an effect on ComponentConfig, where it is possible to configure Extenders and
-	// plugin args (and in which case the extender ignored resources take precedence).
-	if len(ignoredExtendedResources) == 0 {
-		return fExtenders, nil
-	}
-
-	for i := range profiles {
-		prof := &profiles[i]
-		var found = false
-		for k := range prof.PluginConfig {
-			if prof.PluginConfig[k].Name == noderesources.Name {
-				// Update the existing args
-				pc := &prof.PluginConfig[k]
-				args, ok := pc.Args.(*schedulerapi.NodeResourcesFitArgs)
-				if !ok {
-					return nil, fmt.Errorf("want args to be of type NodeResourcesFitArgs, got %T", pc.Args)
-				}
-				args.IgnoredResources = ignoredExtendedResources
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("can't find NodeResourcesFitArgs in plugin config")
-		}
-	}
-	return fExtenders, nil
-}
-
 type FailureHandlerFn func(ctx context.Context, fwk framework.Framework, podInfo *framework.QueuedPodInfo, status *framework.Status, nominatingInfo *framework.NominatingInfo, start time.Time)
-
-func unionedGVKs(queueingHintsPerProfile internalqueue.QueueingHintMapPerProfile) map[framework.EventResource]framework.ActionType {
-	gvkMap := make(map[framework.EventResource]framework.ActionType)
-	for _, queueingHints := range queueingHintsPerProfile {
-		for evt := range queueingHints {
-			if _, ok := gvkMap[evt.Resource]; ok {
-				gvkMap[evt.Resource] |= evt.ActionType
-			} else {
-				gvkMap[evt.Resource] = evt.ActionType
-			}
-		}
-	}
-	return gvkMap
-}
 
 // newPodInformer creates a shared index informer that returns only non-terminal pods.
 // The PodInformer allows indexers to be added, but note that only non-conflict indexers are allowed.

@@ -17,66 +17,69 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"fmt"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // Snapshot is a snapshot of cache NodeInfo and NodeTree order. The scheduler takes a
 // snapshot at the beginning of each scheduling cycle and uses it for its operations in that cycle.
 type Snapshot struct {
-	// nodeInfoMap a map of node name to a snapshot of its NodeInfo.
-	nodeInfoMap map[string]*framework.NodeInfo
-	// nodeInfoList is the list of nodes as ordered in the cache's nodeTree.
-	nodeInfoList []*framework.NodeInfo
-	// havePodsWithAffinityNodeInfoList is the list of nodes with at least one pod declaring affinity terms.
-	havePodsWithAffinityNodeInfoList []*framework.NodeInfo
-	// havePodsWithRequiredAntiAffinityNodeInfoList is the list of nodes with at least one pod declaring
-	// required anti-affinity terms.
-	havePodsWithRequiredAntiAffinityNodeInfoList []*framework.NodeInfo
-	// usedPVCSet contains a set of PVC names that have one or more scheduled pods using them,
-	// keyed in the format "namespace/name".
-	usedPVCSet sets.Set[string]
-	generation int64
+	nodeStore awsstore.NodeStore
+
+	//// nodeInfoMap a map of node name to a snapshot of its NodeInfo.
+	//nodeInfoMap map[string]*framework.NodeInfo
+	//// nodeInfoList is the list of nodes as ordered in the cache's nodeTree.
+	//nodeInfoList []*framework.NodeInfo
+	//// havePodsWithAffinityNodeInfoList is the list of nodes with at least one pod declaring affinity terms.
+	//havePodsWithAffinityNodeInfoList []*framework.NodeInfo
+	//// havePodsWithRequiredAntiAffinityNodeInfoList is the list of nodes with at least one pod declaring
+	//// required anti-affinity terms.
+	//havePodsWithRequiredAntiAffinityNodeInfoList []*framework.NodeInfo
+	//// usedPVCSet contains a set of PVC names that have one or more scheduled pods using them,
+	//// keyed in the format "namespace/name".
+	//usedPVCSet sets.Set[string]
+	//generation int64
 }
 
 var _ framework.SharedLister = &Snapshot{}
 
 // NewEmptySnapshot initializes a Snapshot struct and returns it.
-func NewEmptySnapshot() *Snapshot {
-	return &Snapshot{
-		nodeInfoMap: make(map[string]*framework.NodeInfo),
-		usedPVCSet:  sets.New[string](),
+func NewEmptySnapshot(store awsstore.NodeStore) *Snapshot {
+	if store == nil {
+		panic("NewEmptySnapshot: store must not be nil (pass cache.nodeStore)")
 	}
+	return &Snapshot{nodeStore: store}
 }
 
-// NewSnapshot initializes a Snapshot struct and returns it.
-func NewSnapshot(pods []*v1.Pod, nodes []*v1.Node) *Snapshot {
-	nodeInfoMap := createNodeInfoMap(pods, nodes)
-	nodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
-	havePodsWithAffinityNodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
-	havePodsWithRequiredAntiAffinityNodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
-	for _, v := range nodeInfoMap {
-		nodeInfoList = append(nodeInfoList, v)
-		if len(v.PodsWithAffinity) > 0 {
-			havePodsWithAffinityNodeInfoList = append(havePodsWithAffinityNodeInfoList, v)
-		}
-		if len(v.PodsWithRequiredAntiAffinity) > 0 {
-			havePodsWithRequiredAntiAffinityNodeInfoList = append(havePodsWithRequiredAntiAffinityNodeInfoList, v)
-		}
-	}
-
-	s := NewEmptySnapshot()
-	s.nodeInfoMap = nodeInfoMap
-	s.nodeInfoList = nodeInfoList
-	s.havePodsWithAffinityNodeInfoList = havePodsWithAffinityNodeInfoList
-	s.havePodsWithRequiredAntiAffinityNodeInfoList = havePodsWithRequiredAntiAffinityNodeInfoList
-	s.usedPVCSet = createUsedPVCSet(pods)
-
-	return s
-}
+//// NewSnapshot initializes a Snapshot struct and returns it.
+//func NewSnapshot(pods []*v1.Pod, nodes []*v1.Node) *Snapshot {
+//	nodeInfoMap := createNodeInfoMap(pods, nodes)
+//	nodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
+//	havePodsWithAffinityNodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
+//	havePodsWithRequiredAntiAffinityNodeInfoList := make([]*framework.NodeInfo, 0, len(nodeInfoMap))
+//	for _, v := range nodeInfoMap {
+//		nodeInfoList = append(nodeInfoList, v)
+//		if len(v.PodsWithAffinity) > 0 {
+//			havePodsWithAffinityNodeInfoList = append(havePodsWithAffinityNodeInfoList, v)
+//		}
+//		if len(v.PodsWithRequiredAntiAffinity) > 0 {
+//			havePodsWithRequiredAntiAffinityNodeInfoList = append(havePodsWithRequiredAntiAffinityNodeInfoList, v)
+//		}
+//	}
+//
+//	s := NewEmptySnapshot()
+//	s.nodeInfoMap = nodeInfoMap
+//	s.nodeInfoList = nodeInfoList
+//	s.havePodsWithAffinityNodeInfoList = havePodsWithAffinityNodeInfoList
+//	s.havePodsWithRequiredAntiAffinityNodeInfoList = havePodsWithRequiredAntiAffinityNodeInfoList
+//	s.usedPVCSet = createUsedPVCSet(pods)
+//
+//	return s
+//}
 
 // createNodeInfoMap obtains a list of pods and pivots that list into a map
 // where the keys are node names and the values are the aggregated information
@@ -166,33 +169,97 @@ func (s *Snapshot) StorageInfos() framework.StorageInfoLister {
 
 // NumNodes returns the number of nodes in the snapshot.
 func (s *Snapshot) NumNodes() int {
-	return len(s.nodeInfoList)
+	names, err := s.nodeStore.ListLiveNames(context.Background(), 0)
+	if err != nil {
+		// be conservative on error
+		return 0
+	}
+	return len(names)
 }
 
 // List returns the list of nodes in the snapshot.
 func (s *Snapshot) List() ([]*framework.NodeInfo, error) {
-	return s.nodeInfoList, nil
+	names, err := s.nodeStore.ListLiveNames(context.Background(), 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*framework.NodeInfo, 0, len(names))
+	for _, name := range names {
+		ni, _, _, ok, err := s.nodeStore.GetByName(context.Background(), name)
+		if err != nil {
+			return nil, err
+		}
+		if ok && ni != nil && ni.Node() != nil {
+			out = append(out, ni)
+		}
+	}
+	return out, nil
 }
 
 // HavePodsWithAffinityList returns the list of nodes with at least one pod with inter-pod affinity
 func (s *Snapshot) HavePodsWithAffinityList() ([]*framework.NodeInfo, error) {
-	return s.havePodsWithAffinityNodeInfoList, nil
+	names, err := s.nodeStore.ListLiveNames(context.Background(), 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*framework.NodeInfo, 0)
+	for _, name := range names {
+		ni, _, _, ok, err := s.nodeStore.GetByName(context.Background(), name)
+		if err != nil {
+			return nil, err
+		}
+		if ok && ni != nil && ni.Node() != nil && len(ni.PodsWithAffinity) > 0 {
+			out = append(out, ni)
+		}
+	}
+	return out, nil
 }
 
 // HavePodsWithRequiredAntiAffinityList returns the list of nodes with at least one pod with
 // required inter-pod anti-affinity
 func (s *Snapshot) HavePodsWithRequiredAntiAffinityList() ([]*framework.NodeInfo, error) {
-	return s.havePodsWithRequiredAntiAffinityNodeInfoList, nil
+	names, err := s.nodeStore.ListLiveNames(context.Background(), 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*framework.NodeInfo, 0)
+	for _, name := range names {
+		ni, _, _, ok, err := s.nodeStore.GetByName(context.Background(), name)
+		if err != nil {
+			return nil, err
+		}
+		if ok && ni != nil && ni.Node() != nil && len(ni.PodsWithRequiredAntiAffinity) > 0 {
+			out = append(out, ni)
+		}
+	}
+	return out, nil
 }
 
 // Get returns the NodeInfo of the given node name.
 func (s *Snapshot) Get(nodeName string) (*framework.NodeInfo, error) {
-	if v, ok := s.nodeInfoMap[nodeName]; ok && v.Node() != nil {
-		return v, nil
+	ni, _, _, ok, err := s.nodeStore.GetByName(context.Background(), nodeName)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("nodeinfo not found for node name %q", nodeName)
+	if !ok || ni == nil || ni.Node() == nil {
+		return nil, fmt.Errorf("nodeinfo not found for node name %q", nodeName)
+	}
+	return ni, nil
 }
 
 func (s *Snapshot) IsPVCUsedByPods(key string) bool {
-	return s.usedPVCSet.Has(key)
+	names, err := s.nodeStore.ListLiveNames(context.Background(), 0)
+	if err != nil {
+		return false
+	}
+	for _, name := range names {
+		ni, _, _, ok, err := s.nodeStore.GetByName(context.Background(), name)
+		if err != nil || !ok || ni == nil || ni.Node() == nil {
+			continue
+		}
+		if _, used := ni.PVCRefCounts[key]; used {
+			return true
+		}
+	}
+	return false
 }

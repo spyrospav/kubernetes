@@ -1,4 +1,4 @@
-package awsqueues_test
+package awstest
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ktypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
-	"k8s.io/kubernetes/pkg/scheduler/awsqueues"
+	"k8s.io/kubernetes/pkg/scheduler/awsstore"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"testing"
 	"time"
@@ -21,7 +21,7 @@ func TestBackoffTimeOrderOnly(t *testing.T) {
 	now := time.Now()
 	mc := mockBackoffCalc{m: map[string]time.Time{}}
 
-	less := awsqueues.LessFunc(nil) // nil → compare only by TS
+	less := awsstore.LessFunc(nil) // nil → compare only by TS
 	ctx, pq := setUpBackoffQueue(t, "errorBackoffQ", false, mc.Get, less)
 
 	// three pods finishing back-off in increasing order
@@ -248,9 +248,9 @@ func setUpBackoffQueue(
 	t *testing.T,
 	queueID string,
 	priorityAware bool, // true → include priority in ordering
-	calcFunc awsqueues.BackoffTimeFunc, // normally mockBackoffCalc.Get
-	lessFunc awsqueues.LessFunc, // nil for plain time order
-) (context.Context, *awsqueues.PriorityQueueAWS) {
+	calcFunc awsstore.BackoffTimeFunc, // normally mockBackoffCalc.Get
+	lessFunc awsstore.LessFunc, // nil for plain time order
+) (context.Context, *awsstore.PriorityQueueAWS) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -261,8 +261,8 @@ func setUpBackoffQueue(
 	table := "test_" + queueID
 	_, _ = ddb.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(table)})
 
-	pq, err := awsqueues.NewPriorityQueueAWS(ctx, awsCfg, awsqueues.Config{
-		Backend:        awsqueues.BackendDynamoDB,
+	pq, err := awsstore.NewPriorityQueueAWS(ctx, awsCfg, awsstore.Config{
+		Backend:        awsstore.BackendDynamoDB,
 		TableName:      table,
 		QueueID:        queueID,
 		PriorityAware:  priorityAware,
@@ -282,7 +282,7 @@ func (mc mockBackoffCalc) Get(p *framework.QueuedPodInfo) time.Time {
 	return mc.m[string(p.Pod.UID)]
 }
 
-func lessWithPriority(getTS awsqueues.BackoffTimeFunc) awsqueues.LessFunc {
+func lessWithPriority(getTS awsstore.BackoffTimeFunc) awsstore.LessFunc {
 	return func(p1, p2 *framework.QueuedPodInfo) bool {
 		t1, t2 := getTS(p1), getTS(p2)
 		if !t1.Equal(t2) {

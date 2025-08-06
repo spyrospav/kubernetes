@@ -27,9 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/informers"
-	corelisters "k8s.io/client-go/listers/core/v1"
-	policylisters "k8s.io/client-go/listers/policy/v1"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -48,11 +45,11 @@ const Name = names.DefaultPreemption
 
 // DefaultPreemption is a PostFilter plugin implements the preemption logic.
 type DefaultPreemption struct {
-	fh        framework.Handle
-	fts       feature.Features
-	args      config.DefaultPreemptionArgs
-	podLister corelisters.PodLister
-	pdbLister policylisters.PodDisruptionBudgetLister
+	fh   framework.Handle
+	fts  feature.Features
+	args config.DefaultPreemptionArgs
+	//podLister corelisters.PodLister
+	//pdbLister policylisters.PodDisruptionBudgetLister
 	Evaluator *preemption.Evaluator
 }
 
@@ -74,15 +71,15 @@ func New(_ context.Context, dpArgs runtime.Object, fh framework.Handle, fts feat
 		return nil, err
 	}
 
-	podLister := fh.SharedInformerFactory().Core().V1().Pods().Lister()
-	pdbLister := getPDBLister(fh.SharedInformerFactory())
+	//podLister := fh.SharedInformerFactory().Core().V1().Pods().Lister()
+	//pdbLister := getPDBLister(fh.SharedInformerFactory())
 
 	pl := DefaultPreemption{
-		fh:        fh,
-		fts:       fts,
-		args:      *args,
-		podLister: podLister,
-		pdbLister: pdbLister,
+		fh:   fh,
+		fts:  fts,
+		args: *args,
+		//podLister: podLister,
+		//pdbLister: pdbLister,
 	}
 	pl.Evaluator = preemption.NewEvaluator(Name, fh, &pl, fts.EnableAsyncPreemption)
 
@@ -363,6 +360,6 @@ func filterPodsWithPDBViolation(podInfos []*framework.PodInfo, pdbs []*policy.Po
 	return violatingPodInfos, nonViolatingPodInfos
 }
 
-func getPDBLister(informerFactory informers.SharedInformerFactory) policylisters.PodDisruptionBudgetLister {
-	return informerFactory.Policy().V1().PodDisruptionBudgets().Lister()
-}
+//func getPDBLister(informerFactory informers.SharedInformerFactory) policylisters.PodDisruptionBudgetLister {
+//	return informerFactory.Policy().V1().PodDisruptionBudgets().Lister()
+//}

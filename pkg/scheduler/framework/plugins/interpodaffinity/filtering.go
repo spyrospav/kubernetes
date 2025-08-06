@@ -288,17 +288,17 @@ func (pl *InterPodAffinity) PreFilter(ctx context.Context, cycleState *framework
 	}
 
 	for i := range s.podInfo.RequiredAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(&s.podInfo.RequiredAffinityTerms[i]); err != nil {
+		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(ctx, &s.podInfo.RequiredAffinityTerms[i]); err != nil {
 			return nil, framework.AsStatus(err)
 		}
 	}
 	for i := range s.podInfo.RequiredAntiAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(&s.podInfo.RequiredAntiAffinityTerms[i]); err != nil {
+		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(ctx, &s.podInfo.RequiredAntiAffinityTerms[i]); err != nil {
 			return nil, framework.AsStatus(err)
 		}
 	}
 	logger := klog.FromContext(ctx)
-	s.namespaceLabels = GetNamespaceLabelsSnapshot(logger, pod.Namespace, pl.nsLister)
+	s.namespaceLabels = GetNamespaceLabelsSnapshot(ctx, logger, pod.Namespace, pl.client)
 
 	s.existingAntiAffinityCounts = pl.getExistingAntiAffinityCounts(ctx, pod, s.namespaceLabels, nodesWithRequiredAntiAffinityPods)
 	s.affinityCounts, s.antiAffinityCounts = pl.getIncomingAffinityAntiAffinityCounts(ctx, s.podInfo, allNodes)

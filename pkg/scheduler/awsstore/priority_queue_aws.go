@@ -1,4 +1,4 @@
-package awsqueues
+package awsstore
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"math/rand"
@@ -47,13 +46,6 @@ type BackoffTimeFunc func(*framework.QueuedPodInfo) time.Time
 
 // LessFunc is a function type that compares two QueuedPodInfo objects.
 type LessFunc func(*framework.QueuedPodInfo, *framework.QueuedPodInfo) bool
-
-type wireQueuedPod struct {
-	PodJSON  []byte `json:"pod"`      // raw v1.Pod encoded once
-	Attempts int    `json:"attempts"` // cheap scalars
-	TS       int64  `json:"ts"`       // Unix-nanos
-	Backoff  int64  `json:"backoff,omitempty"`
-}
 
 // Config carries the runtime settings for a queue instance.
 type Config struct {
@@ -103,6 +95,10 @@ func NewPriorityQueueAWS(
 		pq.dynamoClient = dynamodb.NewFromConfig(awsCfg, ddbOpts...)
 		if err := pq.ensureDynamoTable(ctx, pq.dynamoClient, cfg.TableName); err != nil {
 			return nil, err
+		}
+		// clear the table on startup
+		if err := pq.Clear(ctx); err != nil {
+			return nil, fmt.Errorf("failed to clear DynamoDB table %q: %w", cfg.TableName, err)
 		}
 	case BackendSQS:
 		pq.sqsClient = sqs.NewFromConfig(awsCfg, sqsOpts...)
@@ -196,7 +192,7 @@ func (q *PriorityQueueAWS) List(ctx context.Context) ([]*framework.QueuedPodInfo
 		pods := make([]*framework.QueuedPodInfo, 0, len(out.Items))
 		for _, itm := range out.Items {
 			payload := itm["Payload"].(*types.AttributeValueMemberB).Value
-			if pi, err := unmarshalQPI(payload); err == nil {
+			if pi, err := UnmarshalQueuedPodInfo(payload); err == nil {
 				pods = append(pods, pi)
 			} else {
 				klog.Error(err, "Failed to unmarshal pod info", "item", itm)
@@ -229,6 +225,47 @@ func (q *PriorityQueueAWS) Count(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("not implemented: counting SQS queue length")
 	default:
 		return 0, fmt.Errorf("unsupported backend %q", q.cfg.Backend)
+	}
+}
+
+// Clear removes all pods from the queue.
+func (q *PriorityQueueAWS) Clear(ctx context.Context) error {
+	switch q.cfg.Backend {
+	case BackendDynamoDB:
+		pk := q.pk()
+		var last map[string]types.AttributeValue
+		for {
+			out, err := q.dynamoClient.Query(ctx, &dynamodb.QueryInput{
+				TableName:              aws.String(q.cfg.TableName),
+				KeyConditionExpression: aws.String("PK = :pk"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":pk": &types.AttributeValueMemberS{Value: pk},
+				},
+				ProjectionExpression: aws.String("PK, SK"),
+				ExclusiveStartKey:    last,
+			})
+			if err != nil {
+				return err
+			}
+			if len(out.Items) == 0 {
+				return nil
+			}
+			reqs := make([]types.WriteRequest, 0, len(out.Items))
+			for _, it := range out.Items {
+				reqs = append(reqs, types.WriteRequest{
+					DeleteRequest: &types.DeleteRequest{Key: it},
+				})
+			}
+			_, err = q.dynamoClient.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{q.cfg.TableName: reqs},
+			})
+			if err != nil {
+				return err
+			}
+			last = out.LastEvaluatedKey
+		}
+	default:
+		return fmt.Errorf("unsupported backend %q for Clear operation", q.cfg.Backend)
 	}
 }
 
@@ -396,7 +433,7 @@ func (q *PriorityQueueAWS) peekBackoffDynamo(ctx context.Context) (*framework.Qu
 				continue
 			}
 
-			pInfo, err := unmarshalQPI(payloadAttr.Value)
+			pInfo, err := UnmarshalQueuedPodInfo(payloadAttr.Value)
 			if err != nil {
 				klog.Error(err, "Failed to unmarshal pod info", "item", item)
 				continue // skip this item if unmarshalling fails
@@ -437,7 +474,7 @@ func (q *PriorityQueueAWS) peekBackoffDynamo(ctx context.Context) (*framework.Qu
 		return nil, fmt.Errorf("payload attribute missing")
 	}
 
-	pInfo, err := unmarshalQPI(payloadAttr.Value)
+	pInfo, err := UnmarshalQueuedPodInfo(payloadAttr.Value)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
@@ -476,7 +513,7 @@ func (q *PriorityQueueAWS) peekActiveDynamo(ctx context.Context) (*framework.Que
 		return nil, fmt.Errorf("payload attribute missing")
 	}
 
-	pInfo, err := unmarshalQPI(payloadAttr.Value)
+	pInfo, err := UnmarshalQueuedPodInfo(payloadAttr.Value)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
@@ -515,7 +552,7 @@ func (q *PriorityQueueAWS) prepareDynamoItem(pInfo *framework.QueuedPodInfo) (ma
 	}
 
 	// 3. marshal payload -----------------------------------------------------
-	payload, err := marshalQPI(pInfo)
+	payload, err := MarshalQueuedPodInfo(pInfo)
 	if err != nil {
 		return nil, fmt.Errorf("marshal pod: %w", err)
 	}
@@ -605,7 +642,7 @@ func (q *PriorityQueueAWS) popBackoffWithPriority(ctx context.Context) (*framewo
 			continue
 		}
 
-		pInfo, err := unmarshalQPI(payloadAttr.Value)
+		pInfo, err := UnmarshalQueuedPodInfo(payloadAttr.Value)
 		if err != nil {
 			klog.Error(err, "Failed to unmarshal pod info", "item", item)
 			continue // skip this item if unmarshalling fails
@@ -657,46 +694,7 @@ func (q *PriorityQueueAWS) deleteByPodUID(ctx context.Context, uid string) (*fra
 	if !ok {
 		return nil, fmt.Errorf("payload missing")
 	}
-	return unmarshalQPI(pa.Value)
-}
-
-// turn full QueuedPodInfo → wire bytes
-func marshalQPI(q *framework.QueuedPodInfo) ([]byte, error) {
-	pb, err := json.Marshal(q.Pod) // only the real API object
-	if err != nil {
-		return nil, err
-	}
-	w := wireQueuedPod{
-		PodJSON:  pb,
-		Attempts: q.Attempts,
-		TS:       q.Timestamp.UnixNano(),
-	}
-	if !q.BackoffExpiration.IsZero() {
-		w.Backoff = q.BackoffExpiration.UnixNano()
-	}
-	return json.Marshal(&w)
-}
-
-// turn wire bytes → full QueuedPodInfo (re-builds selectors etc.)
-func unmarshalQPI(b []byte) (*framework.QueuedPodInfo, error) {
-	var w wireQueuedPod
-	if err := json.Unmarshal(b, &w); err != nil {
-		return nil, err
-	}
-	var pod v1.Pod
-	if err := json.Unmarshal(w.PodJSON, &pod); err != nil {
-		return nil, err
-	}
-	pi, err := framework.NewPodInfo(&pod) // <- does the heavy work
-	if err != nil {
-		return nil, err
-	}
-	return &framework.QueuedPodInfo{
-		PodInfo:           pi,
-		Attempts:          w.Attempts,
-		Timestamp:         time.Unix(0, w.TS),
-		BackoffExpiration: time.Unix(0, w.Backoff),
-	}, nil
+	return UnmarshalQueuedPodInfo(pa.Value)
 }
 
 func encodeActiveSK(priority int32, t time.Time) int64 {
