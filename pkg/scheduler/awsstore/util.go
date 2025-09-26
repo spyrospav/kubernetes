@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	v1 "k8s.io/api/core/v1"
@@ -11,8 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"os"
-	"time"
 )
 
 // wireQueuedPod is the “on-the-wire” shape we store in DynamoDB.
@@ -47,6 +48,7 @@ type PodState struct {
 	Pod             *v1.Pod
 	Deadline        *time.Time
 	BindingFinished bool
+	Version         int64
 }
 
 type PodRef struct {

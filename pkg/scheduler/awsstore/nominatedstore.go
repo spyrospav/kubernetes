@@ -3,10 +3,13 @@ package awsstore
 import (
 	"context"
 	"encoding/json"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"k8s.io/apimachinery/pkg/types"
+	"fmt"
 	"path"
-	"slices"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -15,95 +18,22 @@ const (
 )
 
 type NominatedStore interface {
-	Put(ctx context.Context, uid types.UID, nodeName string, pr PodRef) error
-	Delete(ctx context.Context, uid types.UID, nodeName string) error
+	Upsert(ctx context.Context, uid k8stypes.UID, node string, pr PodRef) error
+	Put(ctx context.Context, uid k8stypes.UID, nodeName string, pr PodRef) error
+	Delete(ctx context.Context, uid k8stypes.UID, nodeName string) error
 	ListByNode(ctx context.Context, nodeName string) ([]PodRef, error)
-	GetNodeForUID(ctx context.Context, uid types.UID) (string, bool, error)
+	GetNodeForUID(ctx context.Context, uid k8stypes.UID) (string, bool, error)
 	Clear(ctx context.Context) error
 }
 
-//
-// -------------------------  in-memory adapter  ----------------------------- //
-//
-
-type MemNominatedStore struct {
-	byNode map[string][]PodRef // node -> []podRef
-	byUID  map[types.UID]string
-}
-
-func NewMemNominatedStore() *MemNominatedStore {
-	return &MemNominatedStore{
-		byNode: make(map[string][]PodRef),
-		byUID:  make(map[types.UID]string),
-	}
-}
-
-func (m *MemNominatedStore) Put(_ context.Context, uid types.UID, node string, pr PodRef) error {
-	// remove old
-	if old, ok := m.byUID[uid]; ok {
-		list := m.byNode[old]
-		for i := range list {
-			if list[i].uid == uid {
-				m.byNode[old] = append(list[:i], list[i+1:]...)
-				break
-			}
-		}
-		if len(m.byNode[old]) == 0 {
-			delete(m.byNode, old)
-		}
-	}
-	m.byUID[uid] = node
-	m.byNode[node] = append(m.byNode[node], pr)
-	return nil
-}
-
-func (m *MemNominatedStore) Delete(_ context.Context, uid types.UID, node string) error {
-	if node == "" {
-		node = m.byUID[uid]
-	}
-	if node != "" {
-		list := m.byNode[node]
-		for i := range list {
-			if list[i].uid == uid {
-				m.byNode[node] = append(list[:i], list[i+1:]...)
-				break
-			}
-		}
-		if len(m.byNode[node]) == 0 {
-			delete(m.byNode, node)
-		}
-	}
-	delete(m.byUID, uid)
-	return nil
-}
-
-func (m *MemNominatedStore) ListByNode(_ context.Context, node string) ([]PodRef, error) {
-	return slices.Clone(m.byNode[node]), nil
-}
-
-func (m *MemNominatedStore) GetNodeForUID(_ context.Context, uid types.UID) (string, bool, error) {
-	n, ok := m.byUID[uid]
-	return n, ok, nil
-}
-
-func (m *MemNominatedStore) Clear(_ context.Context) error {
-	m.byNode = make(map[string][]PodRef)
-	m.byUID = make(map[types.UID]string)
-	return nil
-}
-
-//
-// ---------------------------  DynamoDB adapter  --------------------------- //
-//
-
 type DDBNominatedStore struct {
 	ctx      context.Context
+	ddb      *dynamodb.Client
 	byNodePS *PartitionStore
 	byUIDPS  *PartitionStore
 }
 
 func NewDDBNominatedStore(ctx context.Context, ddb *dynamodb.Client, wipe bool) (*DDBNominatedStore, error) {
-	// same shared table; different PKs
 	byNode, err := NewPartitionStore(ctx, ddb, PartitionStoreTableName, pkByNode, 0, wipe)
 	if err != nil {
 		return nil, err
@@ -112,25 +42,22 @@ func NewDDBNominatedStore(ctx context.Context, ddb *dynamodb.Client, wipe bool) 
 	if err != nil {
 		return nil, err
 	}
-	return &DDBNominatedStore{ctx: ctx, byNodePS: byNode, byUIDPS: byUID}, nil
+	return &DDBNominatedStore{ctx: ctx, ddb: ddb, byNodePS: byNode, byUIDPS: byUID}, nil
 }
 
-func (s *DDBNominatedStore) Put(ctx context.Context, uid types.UID, node string, pr PodRef) error {
-	// forward index: by node
+func (s *DDBNominatedStore) Put(ctx context.Context, uid k8stypes.UID, node string, pr PodRef) error {
 	key := path.Join(node, string(uid)) // "<node>/<uid>"
 	b, _ := json.Marshal(wireNom{Pod: pr})
 	if err := s.byNodePS.Put(ctx, key, b); err != nil {
 		return err
 	}
-	// reverse index: by uid
 	return s.byUIDPS.Put(ctx, string(uid), []byte(node))
 }
 
-func (s *DDBNominatedStore) Delete(ctx context.Context, uid types.UID, node string) error {
-	// If node is unknown, try reverse lookup:
+func (s *DDBNominatedStore) Delete(ctx context.Context, uid k8stypes.UID, node string) error {
 	if node == "" {
-		if n, ok, _ := s.byUIDPS.Get(ctx, string(uid)); ok {
-			node = string(n)
+		if b, _, ok, _ := s.byUIDPS.Get(ctx, string(uid)); ok {
+			node = string(b)
 		}
 	}
 	if node != "" {
@@ -154,8 +81,8 @@ func (s *DDBNominatedStore) ListByNode(ctx context.Context, node string) ([]PodR
 	return out, nil
 }
 
-func (s *DDBNominatedStore) GetNodeForUID(ctx context.Context, uid types.UID) (string, bool, error) {
-	b, ok, err := s.byUIDPS.Get(ctx, string(uid))
+func (s *DDBNominatedStore) GetNodeForUID(ctx context.Context, uid k8stypes.UID) (string, bool, error) {
+	b, _, ok, err := s.byUIDPS.Get(ctx, string(uid))
 	if err != nil || !ok {
 		return "", false, err
 	}
@@ -167,4 +94,88 @@ func (s *DDBNominatedStore) Clear(ctx context.Context) error {
 		return err
 	}
 	return s.byUIDPS.Clear(ctx)
+}
+
+func (s *DDBNominatedStore) Upsert(ctx context.Context, uid k8stypes.UID, node string, pr PodRef) error {
+	const maxAttempts = 8
+	uidKey := string(uid)
+
+	payload, _ := json.Marshal(wireNom{Pod: pr})
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// 1) read current reverse mapping
+		oldB, _, ok, err := s.byUIDPS.Get(ctx, uidKey)
+		if err != nil {
+			return err
+		}
+		oldNode := ""
+		if ok {
+			oldNode = string(oldB)
+		}
+
+		// 2) build txn
+		items := make([]ddbtypes.TransactWriteItem, 0, 3)
+
+		// delete old forward index if moving across nodes
+		if oldNode != "" && oldNode != node {
+			items = append(items, ddbtypes.TransactWriteItem{
+				Delete: &ddbtypes.Delete{
+					TableName: aws.String(s.byNodePS.table),
+					Key: map[string]ddbtypes.AttributeValue{
+						attrPK: &ddbtypes.AttributeValueMemberS{Value: s.byNodePS.pk},
+						attrSK: &ddbtypes.AttributeValueMemberS{Value: path.Join(oldNode, uidKey)},
+					},
+				},
+			})
+		}
+
+		// put new forward index
+		items = append(items, ddbtypes.TransactWriteItem{
+			Put: &ddbtypes.Put{
+				TableName: aws.String(s.byNodePS.table),
+				Item: map[string]ddbtypes.AttributeValue{
+					attrPK: &ddbtypes.AttributeValueMemberS{Value: s.byNodePS.pk},
+					attrSK: &ddbtypes.AttributeValueMemberS{Value: path.Join(node, uidKey)},
+					attrPi: &ddbtypes.AttributeValueMemberB{Value: payload},
+				},
+			},
+		})
+
+		// reverse index: uid -> node (CAS on old value)
+		cond := "attribute_not_exists(" + attrPi + ")"
+		var eav map[string]ddbtypes.AttributeValue
+		if oldNode != "" {
+			cond += " OR " + attrPi + " = :old"
+			eav = map[string]ddbtypes.AttributeValue{
+				":old": &ddbtypes.AttributeValueMemberB{Value: []byte(oldNode)},
+			}
+		}
+
+		items = append(items, ddbtypes.TransactWriteItem{
+			Put: &ddbtypes.Put{
+				TableName: aws.String(s.byUIDPS.table),
+				Item: map[string]ddbtypes.AttributeValue{
+					attrPK: &ddbtypes.AttributeValueMemberS{Value: s.byUIDPS.pk},
+					attrSK: &ddbtypes.AttributeValueMemberS{Value: uidKey},
+					// keep it BINARY to match PartitionStore.Get
+					attrPi: &ddbtypes.AttributeValueMemberB{Value: []byte(node)},
+				},
+				ConditionExpression:       aws.String(cond),
+				ExpressionAttributeValues: eav, // nil when no :old
+			},
+		})
+
+		// 3) execute txn
+		_, err = s.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			TransactItems: items,
+		})
+		if err == nil {
+			return nil
+		}
+		if isCCF(err) {
+			continue
+		} // retry on conflict
+		return err
+	}
+	return fmt.Errorf("%w: Upsert nomination for %s -> %s", ErrConflict, uid, node)
 }

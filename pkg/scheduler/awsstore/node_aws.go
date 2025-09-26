@@ -2,11 +2,14 @@ package awsstore
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"strconv"
-	"time"
 )
 
 const (
@@ -25,47 +28,87 @@ type nodeAWS struct {
 	ddb   *dynamodb.Client
 }
 
+func isCCF(err error) bool {
+	var ccf *types.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		return true
+	}
+	var tce *types.TransactionCanceledException
+	if errors.As(err, &tce) {
+		for _, r := range tce.CancellationReasons {
+			if r.Code != nil && *r.Code == "ConditionalCheckFailed" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func newNodeAWS(table string, ddb *dynamodb.Client) *nodeAWS {
 	return &nodeAWS{table: table, ddb: ddb}
 }
 
 func (n *nodeAWS) put(ctx context.Context, name string, payload []byte, gen int64, ts time.Time, live bool) error {
-	item := map[string]types.AttributeValue{
-		nodeTablePK: &types.AttributeValueMemberS{Value: nodePKByName},
-		nodeTableSK: &types.AttributeValueMemberS{Value: name},
-		nodeAttrPi:  &types.AttributeValueMemberB{Value: payload},
-		nodeAttrGen: &types.AttributeValueMemberN{Value: strconv.FormatInt(gen, 10)},
-		nodeAttrTS:  &types.AttributeValueMemberN{Value: strconv.FormatInt(ts.UnixMilli(), 10)},
-	}
-	if _, err := n.ddb.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(n.table),
-		Item:      item,
-	}); err != nil {
-		return err
-	}
+	newGen := gen + 1
 
-	if live {
-		// upsert live marker
-		_, err := n.ddb.PutItem(ctx, &dynamodb.PutItemInput{
+	updateNode := types.TransactWriteItem{
+		Update: &types.Update{
 			TableName: aws.String(n.table),
-			Item: map[string]types.AttributeValue{
-				nodeTablePK: &types.AttributeValueMemberS{Value: nodePKLive},
+			Key: map[string]types.AttributeValue{
+				nodeTablePK: &types.AttributeValueMemberS{Value: nodePKByName},
 				nodeTableSK: &types.AttributeValueMemberS{Value: name},
-				nodeAttrTS:  &types.AttributeValueMemberN{Value: strconv.FormatInt(ts.UnixMilli(), 10)},
 			},
-		})
-		return err
+			// Allow to create when Gen doesn't exist; otherwise require Gen == :exp
+			ConditionExpression: aws.String(
+				"attribute_not_exists(" + nodeAttrGen + ") OR " + nodeAttrGen + " = :exp",
+			),
+			UpdateExpression: aws.String(
+				"SET " + nodeAttrPi + " = :pi, " + nodeAttrGen + " = :newGen, " + nodeAttrTS + " = :ts",
+			),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pi":     &types.AttributeValueMemberB{Value: payload},
+				":exp":    &types.AttributeValueMemberN{Value: strconv.FormatInt(gen, 10)},
+				":newGen": &types.AttributeValueMemberN{Value: strconv.FormatInt(newGen, 10)},
+				":ts":     &types.AttributeValueMemberN{Value: strconv.FormatInt(ts.UnixMilli(), 10)},
+			},
+		},
 	}
 
-	// ghost: delete live marker if present
-	_, err := n.ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String(n.table),
-		Key: map[string]types.AttributeValue{
-			nodeTablePK: &types.AttributeValueMemberS{Value: nodePKLive},
-			nodeTableSK: &types.AttributeValueMemberS{Value: name},
-		},
+	var liveOp types.TransactWriteItem
+	if live {
+		liveOp = types.TransactWriteItem{
+			Put: &types.Put{
+				TableName: aws.String(n.table),
+				Item: map[string]types.AttributeValue{
+					nodeTablePK: &types.AttributeValueMemberS{Value: nodePKLive},
+					nodeTableSK: &types.AttributeValueMemberS{Value: name},
+					nodeAttrTS:  &types.AttributeValueMemberN{Value: strconv.FormatInt(ts.UnixMilli(), 10)},
+				},
+			},
+		}
+	} else {
+		liveOp = types.TransactWriteItem{
+			Delete: &types.Delete{
+				TableName: aws.String(n.table),
+				Key: map[string]types.AttributeValue{
+					nodeTablePK: &types.AttributeValueMemberS{Value: nodePKLive},
+					nodeTableSK: &types.AttributeValueMemberS{Value: name},
+				},
+				// No condition: delete is idempotent even if not present
+			},
+		}
+	}
+
+	_, err := n.ddb.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{updateNode, liveOp},
 	})
-	return err
+	if err != nil {
+		if isCCF(err) {
+			return fmt.Errorf("%w: node %q generation conflict (expected %d)", ErrConflict, name, gen)
+		}
+		return err
+	}
+	return nil
 }
 
 func (n *nodeAWS) get(ctx context.Context, name string) ([]byte, int64, int64, bool, error) {
@@ -213,4 +256,11 @@ func (n *nodeAWS) clear(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (n *nodeAWS) keyFor(name string) map[string]types.AttributeValue {
+	return map[string]types.AttributeValue{
+		nodeTablePK: &types.AttributeValueMemberS{Value: nodePKByName},
+		nodeTableSK: &types.AttributeValueMemberS{Value: name},
+	}
 }

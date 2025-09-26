@@ -20,14 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/types"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -85,7 +84,8 @@ type Scheduler struct {
 	SchedulingQueue internalqueue.SchedulingQueue
 
 	// Profiles are the scheduling profiles.
-	Profiles profile.Map
+	//Profiles profile.Map
+	Framework framework.Framework
 
 	client clientset.Interface
 
@@ -136,7 +136,7 @@ type ScheduleResult struct {
 	// The number of nodes out of the evaluated ones that fit the pod.
 	FeasibleNodes int
 	// The nominating info for scheduling cycle.
-	nominatingInfo *framework.NominatingInfo
+	NominatingInfo *framework.NominatingInfo
 }
 
 // WithComponentConfigVersion sets the component config version to the
@@ -311,6 +311,8 @@ func New(ctx context.Context,
 		fwk.SetPodActivator(podQueue)
 	}
 
+	defaultFwk := profiles[options.profiles[0].SchedulerName]
+
 	sched := &Scheduler{
 		Cache:                    schedulerCache,
 		client:                   client,
@@ -318,8 +320,9 @@ func New(ctx context.Context,
 		percentageOfNodesToScore: options.percentageOfNodesToScore,
 		StopEverything:           stopEverything,
 		SchedulingQueue:          podQueue,
-		Profiles:                 profiles,
-		logger:                   logger,
+		//Profiles:                 profiles,
+		Framework: defaultFwk,
+		logger:    logger,
 	}
 	sched.NextPod = podQueue.Pop
 	sched.applyDefaultHandlers()
@@ -330,14 +333,12 @@ func New(ctx context.Context,
 // Run begins watching and scheduling. It starts scheduling and blocked until the context is done.
 func (sched *Scheduler) Run(ctx context.Context) {
 	logger := klog.FromContext(ctx)
-	sched.SchedulingQueue.Run(logger)
+	//sched.SchedulingQueue.Run(logger)
 
-	// "Prime the pump" by running the polling loop once synchronously at startup.
-	// This ensures the cache is populated before the main scheduling loop begins.
-	sched.pollingLoop(ctx)
+	//sched.pollingLoop(ctx)
 
 	// Start the new polling loop in the background.
-	go wait.UntilWithContext(ctx, sched.pollingLoop, 5*time.Second)
+	//go wait.UntilWithContext(ctx, sched.pollingLoop, 5*time.Second)
 
 	// We need to start scheduleOne loop in a dedicated goroutine,
 	// because scheduleOne function hangs on getting the next item
@@ -345,13 +346,14 @@ func (sched *Scheduler) Run(ctx context.Context) {
 	// If there are no new pods to schedule, it will be hanging there
 	// and if done in this goroutine it will be blocking closing
 	// SchedulingQueue, in effect causing a deadlock on shutdown.
-	go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
+	//go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
 
 	<-ctx.Done()
 	sched.SchedulingQueue.Close()
 
 	// If the plugins satisfy the io.Closer interface, they are closed.
-	err := sched.Profiles.Close()
+	//err := sched.Profiles.Close()
+	err := sched.Framework.Close()
 	if err != nil {
 		logger.Error(err, "Failed to close plugins")
 	}
@@ -415,7 +417,11 @@ func (sched *Scheduler) pollingLoop(ctx context.Context) {
 	// Handle node deletions
 	for name, cachedNode := range cachedNodesMap {
 		if _, exists := apiNodesMap[name]; !exists {
-			sched.Cache.RemoveNode(logger, cachedNode)
+			err := sched.Cache.RemoveNode(logger, cachedNode)
+			if err != nil {
+				logger.Error(err, "Polling failed: cannot remove node", "node", klog.KObj(cachedNode))
+				return
+			}
 		}
 	}
 
@@ -436,11 +442,19 @@ func (sched *Scheduler) pollingLoop(ctx context.Context) {
 	for uid, apiPod := range apiPodsMap {
 		if cachedPod, exists := cachedPodsMap[uid]; !exists {
 			// Pod is in API but not cache -> ADD
-			sched.Cache.AddPod(logger, apiPod)
+			err := sched.Cache.AddPod(logger, apiPod)
+			if err != nil {
+				logger.Error(err, "Polling failed: cannot add pod", "pod", klog.KObj(apiPod))
+				return
+			}
 		} else {
 			// Pod is in both -> check if it needs an UPDATE
 			if apiPod.ResourceVersion != cachedPod.ResourceVersion {
-				sched.Cache.UpdatePod(logger, cachedPod, apiPod)
+				err := sched.Cache.UpdatePod(logger, cachedPod, apiPod)
+				if err != nil {
+					logger.Error(err, "Polling failed: cannot update pod", "pod", klog.KObj(apiPod))
+					return
+				}
 			}
 		}
 	}
@@ -448,7 +462,11 @@ func (sched *Scheduler) pollingLoop(ctx context.Context) {
 	for uid, cachedPod := range cachedPodsMap {
 		if _, exists := apiPodsMap[uid]; !exists {
 			// Pod is in cache but not API -> DELETE
-			sched.Cache.RemovePod(logger, cachedPod)
+			err := sched.Cache.RemovePod(logger, cachedPod)
+			if err != nil {
+				logger.Error(err, "Polling failed: cannot remove pod", "pod", klog.KObj(cachedPod))
+				return
+			}
 		}
 	}
 

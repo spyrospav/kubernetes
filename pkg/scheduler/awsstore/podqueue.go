@@ -13,7 +13,7 @@ concrete *heap.Heap.  Anything implementing this interface can serve as the
 “active Q”.
 */
 type PodQueue interface {
-	AddOrUpdate(*framework.QueuedPodInfo)
+	AddOrUpdate(*framework.QueuedPodInfo) error
 	Get(*framework.QueuedPodInfo) (*framework.QueuedPodInfo, bool)
 	Has(*framework.QueuedPodInfo) bool
 	Delete(*framework.QueuedPodInfo) error
@@ -31,7 +31,7 @@ type HeapPQ struct {
 	H *heap.Heap[*framework.QueuedPodInfo]
 } // ← exported
 
-func (q HeapPQ) AddOrUpdate(p *framework.QueuedPodInfo)                          { q.H.AddOrUpdate(p) }
+func (q HeapPQ) AddOrUpdate(p *framework.QueuedPodInfo) error                    { q.H.AddOrUpdate(p); return nil }
 func (q HeapPQ) Get(p *framework.QueuedPodInfo) (*framework.QueuedPodInfo, bool) { return q.H.Get(p) }
 func (q HeapPQ) Has(p *framework.QueuedPodInfo) bool                             { return q.H.Has(p) }
 func (q HeapPQ) Delete(p *framework.QueuedPodInfo) error                         { return q.H.Delete(p) }
@@ -49,7 +49,7 @@ type DDBPQ struct {
 	Aws *PriorityQueueAWS
 }
 
-func (q DDBPQ) AddOrUpdate(p *framework.QueuedPodInfo) { _ = q.Aws.AddOrUpdate(q.Ctx, p) }
+func (q DDBPQ) AddOrUpdate(p *framework.QueuedPodInfo) error { return q.Aws.AddOrUpdate(q.Ctx, p) }
 func (q DDBPQ) Get(*framework.QueuedPodInfo) (*framework.QueuedPodInfo, bool) {
 	return nil, false // no point-lookup support
 }

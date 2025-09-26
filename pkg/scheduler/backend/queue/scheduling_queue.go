@@ -29,22 +29,23 @@ package queue
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/kubernetes/pkg/scheduler/awsstore"
-	"reflect"
-	"sync"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/wait"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -1095,7 +1096,7 @@ func newUnschedulablePods(awsCfg aws.Config, useDynamo bool, unschedulableRecord
 			awsstore.PartitionStoreTableName,
 			"unschedulable-pods",
 			0,
-			true,
+			false,
 		)
 		if err != nil {
 			panic(err)

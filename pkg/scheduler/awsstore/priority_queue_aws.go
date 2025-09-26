@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"math/rand"
 	"strconv"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -74,6 +75,8 @@ type PriorityQueueAWS struct {
 	criticalURL string
 	systemURL   string
 	bucketSize  int32 // = normalMaxPriority / NumBuckets
+
+	wipeOnStart bool
 }
 
 // NewPriorityQueueAWS creates a new PriorityQueueAWS instance based on the provided configuration.
@@ -83,6 +86,7 @@ func NewPriorityQueueAWS(
 	cfg Config,
 	ddbOpts []func(*dynamodb.Options),
 	sqsOpts []func(*sqs.Options),
+	wipeOnStart bool,
 ) (*PriorityQueueAWS, error) {
 
 	pq := &PriorityQueueAWS{cfg: cfg}
@@ -97,8 +101,10 @@ func NewPriorityQueueAWS(
 			return nil, err
 		}
 		// clear the table on startup
-		if err := pq.Clear(ctx); err != nil {
-			return nil, fmt.Errorf("failed to clear DynamoDB table %q: %w", cfg.TableName, err)
+		if wipeOnStart {
+			if err := pq.Clear(ctx); err != nil {
+				return nil, fmt.Errorf("failed to clear DynamoDB table %q: %w", cfg.TableName, err)
+			}
 		}
 	case BackendSQS:
 		pq.sqsClient = sqs.NewFromConfig(awsCfg, sqsOpts...)
@@ -285,7 +291,7 @@ func (q *PriorityQueueAWS) addOrUpdateDynamo(ctx context.Context, pInfo *framewo
 	_, err = q.dynamoClient.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName:           aws.String(q.cfg.TableName),
 		Item:                item,
-		ConditionExpression: aws.String("attribute_not_exists(PK)"),
+		ConditionExpression: aws.String("attribute_not_exists(SK)"),
 	})
 	if err == nil {
 		return nil // new pod inserted
@@ -333,6 +339,7 @@ func (q *PriorityQueueAWS) popBackoffDynamo(ctx context.Context) (*framework.Que
 
 	// For backoff queues with custom sorting (e.g., with priority),
 	// we need to fetch multiple items and apply the comparison function
+	// By default, not consider the priority case.
 	if q.isBackoffQueue() && q.cfg.PriorityAware {
 		return q.popBackoffWithPriority(ctx)
 	}
@@ -533,22 +540,23 @@ func (q *PriorityQueueAWS) prepareDynamoItem(pInfo *framework.QueuedPodInfo) (ma
 
 	// 2. choose time component ----------------------------------------------
 	var (
-		ts int64     // *numeric* sort key for the GSI
-		bo time.Time // real back-off completion, if any
+		ts int64
+		bo time.Time
 	)
 
 	if q.isBackoffQueue() {
-		if q.cfg.GetBackoffTime != nil {
-			bo = q.cfg.GetBackoffTime(pInfo)
-		} else {
-			// Should never happen, but be safe
+		if q.cfg.GetBackoffTime == nil {
 			klog.Error(nil, "Backoff time not set", "pod", pInfo.Pod)
 			return nil, fmt.Errorf("backoff time not set for pod %s", pInfo.Pod.UID)
 		}
-		includePr := q.cfg.PriorityAware
-		ts = encodeBackoffSK(bo.UnixMilli(), pr, includePr)
+		bo = q.cfg.GetBackoffTime(pInfo)
+		ts = encodeBackoffSK(bo.UnixMilli(), pr, q.cfg.PriorityAware)
 	} else {
-		ts = encodeActiveSK(pr, time.Now())
+		// Ensure we *persist* the same timestamp we use for TS
+		if pInfo.Timestamp.IsZero() {
+			pInfo.Timestamp = time.Now()
+		}
+		ts = encodeActiveSK(pr, pInfo.Timestamp)
 	}
 
 	// 3. marshal payload -----------------------------------------------------

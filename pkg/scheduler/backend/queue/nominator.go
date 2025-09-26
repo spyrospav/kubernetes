@@ -19,11 +19,12 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
+
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/pkg/scheduler/awsstore"
-	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,27 +62,21 @@ type nominator struct {
 }
 
 func newPodNominator(client kubernetes.Interface) *nominator {
-	useDynamo := true
 
 	var store awsstore.NominatedStore
 	var err error
 
-	if useDynamo {
-		awsCfg := awsstore.BuildAWSConfig()
-		klog.Infof("Using DynamoDB backend for nominator maps")
+	awsCfg := awsstore.BuildAWSConfig()
+	klog.Infof("Using DynamoDB backend for nominator maps")
 
-		ddb := dynamodb.NewFromConfig(awsCfg)
-		if err = awsstore.EnsurePartitionStoreTable(context.Background(), ddb, awsstore.PartitionStoreTableName); err != nil {
-			panic(fmt.Sprintf("Failed to ensure partition store table: %v", err))
-		}
+	ddb := dynamodb.NewFromConfig(awsCfg)
+	if err = awsstore.EnsurePartitionStoreTable(context.Background(), ddb, awsstore.PartitionStoreTableName); err != nil {
+		panic(fmt.Sprintf("Failed to ensure partition store table: %v", err))
+	}
 
-		store, err = awsstore.NewDDBNominatedStore(context.Background(), ddb, true)
-		if err != nil {
-			panic(err)
-		}
-	} else {
-		store = awsstore.NewMemNominatedStore()
-		klog.Infof("Using in-memory backend for nominator maps")
+	store, err = awsstore.NewDDBNominatedStore(context.Background(), ddb, true)
+	if err != nil {
+		panic(err)
 	}
 
 	return &nominator{

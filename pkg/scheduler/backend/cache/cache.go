@@ -19,11 +19,12 @@ package cache
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"k8s.io/kubernetes/pkg/scheduler/awsstore"
-	"sync"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -56,7 +57,7 @@ type nodeInfoListItem struct {
 	prev *nodeInfoListItem
 }
 
-type cacheImpl struct {
+type CacheImpl struct {
 	stop   <-chan struct{}
 	ttl    time.Duration
 	period time.Duration
@@ -74,7 +75,7 @@ type cacheImpl struct {
 	snapshot *Snapshot
 }
 
-func newCache(ctx context.Context, ttl, period time.Duration) *cacheImpl {
+func newCache(ctx context.Context, ttl, period time.Duration) *CacheImpl {
 	useDynamo := true
 
 	var (
@@ -95,7 +96,7 @@ func newCache(ctx context.Context, ttl, period time.Duration) *cacheImpl {
 		}
 
 		// Pod state
-		ps, err := awsstore.NewPartitionStore(ctx, ddb, awsstore.PartitionStoreTableName, "cache-podstate", 0, true)
+		ps, err := awsstore.NewPartitionStore(ctx, ddb, awsstore.PartitionStoreTableName, "cache-podstate", 0, false)
 		if err != nil {
 			panic(err)
 		}
@@ -105,7 +106,7 @@ func newCache(ctx context.Context, ttl, period time.Duration) *cacheImpl {
 		if err := awsstore.EnsureNodeStoreTable(ctx, ddb, awsstore.NodeStoreTableName); err != nil {
 			panic(fmt.Sprintf("Failed to ensure node store table: %v", err))
 		}
-		nsAdapter, err := awsstore.NewDDBNodeStore(ctx, ddb, awsstore.NodeStoreTableName, true /*wipe on start for dev*/)
+		nsAdapter, err := awsstore.NewDDBNodeStore(ctx, ddb, awsstore.NodeStoreTableName, false)
 		if err != nil {
 			panic(err)
 		}
@@ -113,14 +114,11 @@ func newCache(ctx context.Context, ttl, period time.Duration) *cacheImpl {
 
 		klog.Infof("Using DynamoDB backend for node store")
 	} else {
-		klog.Infof("Using in-memory backend for scheduler cache")
-		pss = awsstore.NewInMemoryPodStateStore()
-		ns = awsstore.NewMemNodeStore()
 	}
 
 	snap := NewEmptySnapshot(ns)
 
-	return &cacheImpl{
+	return &CacheImpl{
 		ttl:    ttl,
 		period: period,
 		stop:   ctx.Done(),
@@ -133,6 +131,18 @@ func newCache(ctx context.Context, ttl, period time.Duration) *cacheImpl {
 	}
 }
 
+func NewCacheFacade(ns awsstore.NodeStore, ps awsstore.PodStateStore) *CacheImpl {
+	return &CacheImpl{
+		// no background goroutines; no run()
+		nodeStore:     ns,
+		podStateStore: ps,
+		ttl:           0,
+		period:        0,
+		stop:          make(<-chan struct{}), // unused
+		snapshot:      NewEmptySnapshot(ns),  // harmless; UpdateSnapshot is effectively no-op
+	}
+}
+
 // newNodeInfoListItem initializes a new nodeInfoListItem.
 func newNodeInfoListItem(ni *framework.NodeInfo) *nodeInfoListItem {
 	return &nodeInfoListItem{
@@ -140,62 +150,11 @@ func newNodeInfoListItem(ni *framework.NodeInfo) *nodeInfoListItem {
 	}
 }
 
-//// moveNodeInfoToHead moves a NodeInfo to the head of "cache.nodes" doubly
-//// linked list. The head is the most recently updated NodeInfo.
-//// We assume cache lock is already acquired.
-//func (cache *cacheImpl) moveNodeInfoToHead(logger klog.Logger, name string) {
-//	ni, ok := cache.nodes[name]
-//	if !ok {
-//		logger.Error(nil, "No node info with given name found in the cache", "node", klog.KRef("", name))
-//		return
-//	}
-//	// if the node info list item is already at the head, we are done.
-//	if ni == cache.headNode {
-//		return
-//	}
-//
-//	if ni.prev != nil {
-//		ni.prev.next = ni.next
-//	}
-//	if ni.next != nil {
-//		ni.next.prev = ni.prev
-//	}
-//	if cache.headNode != nil {
-//		cache.headNode.prev = ni
-//	}
-//	ni.next = cache.headNode
-//	ni.prev = nil
-//	cache.headNode = ni
-//}
-
-//// removeNodeInfoFromList removes a NodeInfo from the "cache.nodes" doubly
-//// linked list.
-//// We assume cache lock is already acquired.
-//func (cache *cacheImpl) removeNodeInfoFromList(logger klog.Logger, name string) {
-//	ni, ok := cache.nodes[name]
-//	if !ok {
-//		logger.Error(nil, "No node info with given name found in the cache", "node", klog.KRef("", name))
-//		return
-//	}
-//
-//	if ni.prev != nil {
-//		ni.prev.next = ni.next
-//	}
-//	if ni.next != nil {
-//		ni.next.prev = ni.prev
-//	}
-//	// if the removed item was at the head, we must update the head.
-//	if ni == cache.headNode {
-//		cache.headNode = ni.next
-//	}
-//	delete(cache.nodes, name)
-//}
-
 // Dump produces a dump of the current scheduler cache. This is used for
 // debugging purposes only and shouldn't be confused with UpdateSnapshot
 // function.
 // This method is expensive, and should be only used in non-critical path.
-func (cache *cacheImpl) Dump() *Dump {
+func (cache *CacheImpl) Dump() *Dump {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
@@ -223,7 +182,7 @@ func (cache *cacheImpl) Dump() *Dump {
 	}
 }
 
-func (cache *cacheImpl) Snapshot() *Snapshot {
+func (cache *CacheImpl) Snapshot() *Snapshot {
 	return cache.snapshot
 }
 
@@ -233,7 +192,7 @@ func (cache *cacheImpl) Snapshot() *Snapshot {
 // nodeInfo.Node() is guaranteed to be not nil for all the nodes in the snapshot.
 // This function tracks generation number of NodeInfo and updates only the
 // entries of an existing snapshot that have changed after the snapshot was taken.
-func (cache *cacheImpl) UpdateSnapshot(logger klog.Logger, nodeSnapshot *Snapshot) error {
+func (cache *CacheImpl) UpdateSnapshot(logger klog.Logger, nodeSnapshot *Snapshot) error {
 	//cache.mu.Lock()
 	//defer cache.mu.Unlock()
 	//
@@ -416,7 +375,7 @@ func (cache *cacheImpl) UpdateSnapshot(logger klog.Logger, nodeSnapshot *Snapsho
 
 // NodeCount returns the number of nodes in the cache.
 // DO NOT use outside of tests.
-func (cache *cacheImpl) NodeCount() int {
+func (cache *CacheImpl) NodeCount() int {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	names, err := cache.nodeStore.ListLiveNames(context.Background(), 0)
@@ -428,7 +387,7 @@ func (cache *cacheImpl) NodeCount() int {
 
 // PodCount returns the number of pods in the cache (including those from deleted nodes).
 // DO NOT use outside of tests.
-func (cache *cacheImpl) PodCount() (int, error) {
+func (cache *CacheImpl) PodCount() (int, error) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 	states, _, err := cache.podStateStore.List(context.Background())
@@ -438,7 +397,7 @@ func (cache *cacheImpl) PodCount() (int, error) {
 	return len(states), nil
 }
 
-func (cache *cacheImpl) AssumePod(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) AssumePod(logger klog.Logger, pod *v1.Pod) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -449,19 +408,19 @@ func (cache *cacheImpl) AssumePod(logger klog.Logger, pod *v1.Pod) error {
 	//if _, ok := cache.podStates[key]; ok {
 	//	return fmt.Errorf("pod %v(%v) is in the cache, so can't be assumed", key, klog.KObj(pod))
 	//}
-	if _, _, found, _ := cache.podStateStore.Get(context.Background(), key); found {
+	if _, _, found, _, _ := cache.podStateStore.Get(context.Background(), key); found {
 		return fmt.Errorf("pod %q already in cache", key)
 	}
 
 	return cache.addPod(logger, pod, true)
 }
 
-func (cache *cacheImpl) FinishBinding(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) FinishBinding(logger klog.Logger, pod *v1.Pod) error {
 	return cache.finishBinding(logger, pod, time.Now())
 }
 
 // finishBinding exists to make tests deterministic by injecting now as an argument
-func (cache *cacheImpl) finishBinding(logger klog.Logger, pod *v1.Pod, now time.Time) error {
+func (cache *CacheImpl) finishBinding(logger klog.Logger, pod *v1.Pod, now time.Time) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -471,7 +430,7 @@ func (cache *cacheImpl) finishBinding(logger klog.Logger, pod *v1.Pod, now time.
 	defer cache.mu.RUnlock()
 
 	logger.V(5).Info("Finished binding for pod, can be expired", "podKey", key, "pod", klog.KObj(pod))
-	ps, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
+	ps, _, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
 	if err != nil || !found {
 		return fmt.Errorf("no podState for %q", key)
 	}
@@ -483,7 +442,8 @@ func (cache *cacheImpl) finishBinding(logger klog.Logger, pod *v1.Pod, now time.
 			ps.Deadline = &dl
 		}
 		ps.BindingFinished = true
-		return cache.podStateStore.Put(context.Background(), key, ps, true)
+		//return cache.podStateStore.Put(context.Background(), key, ps, true)
+		return cache.podStateStore.Put(context.Background(), key, ps, awsstore.PutOptions{KeepAssumed: true, Mode: awsstore.PutUpdate})
 	}
 	return nil
 
@@ -500,7 +460,7 @@ func (cache *cacheImpl) finishBinding(logger klog.Logger, pod *v1.Pod, now time.
 	//return nil
 }
 
-func (cache *cacheImpl) ForgetPod(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) ForgetPod(logger klog.Logger, pod *v1.Pod) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -509,7 +469,7 @@ func (cache *cacheImpl) ForgetPod(logger klog.Logger, pod *v1.Pod) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
-	ps, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
+	ps, _, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
 	if err != nil {
 		return err
 	}
@@ -535,7 +495,7 @@ func (cache *cacheImpl) ForgetPod(logger klog.Logger, pod *v1.Pod) error {
 }
 
 // Assumes that lock is already acquired.
-func (cache *cacheImpl) addPod(logger klog.Logger, pod *v1.Pod, assumePod bool) error {
+func (cache *CacheImpl) addPod(logger klog.Logger, pod *v1.Pod, assumePod bool) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -558,11 +518,12 @@ func (cache *cacheImpl) addPod(logger klog.Logger, pod *v1.Pod, assumePod bool) 
 	}
 
 	ps := &awsstore.PodState{Pod: pod}
-	return cache.podStateStore.Put(ctx, key, ps, assumePod)
+	//return cache.podStateStore.Put(ctx, key, ps, assumePod)
+	return cache.podStateStore.Put(ctx, key, ps, awsstore.PutOptions{KeepAssumed: assumePod, Mode: awsstore.PutCreate})
 }
 
 // Assumes that lock is already acquired.
-func (cache *cacheImpl) updatePod(logger klog.Logger, oldPod, newPod *v1.Pod) error {
+func (cache *CacheImpl) updatePod(logger klog.Logger, oldPod, newPod *v1.Pod) error {
 	if err := cache.removePod(logger, oldPod); err != nil {
 		return err
 	}
@@ -573,7 +534,7 @@ func (cache *cacheImpl) updatePod(logger klog.Logger, oldPod, newPod *v1.Pod) er
 // Removes a pod from the cached node info. If the node information was already
 // removed and there are no more pods left in the node, cleans up the node from
 // the cache.
-func (cache *cacheImpl) removePod(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) removePod(logger klog.Logger, pod *v1.Pod) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -618,7 +579,7 @@ func (cache *cacheImpl) removePod(logger klog.Logger, pod *v1.Pod) error {
 	return cache.podStateStore.Delete(context.TODO(), key)
 }
 
-func (cache *cacheImpl) AddPod(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) AddPod(logger klog.Logger, pod *v1.Pod) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -627,7 +588,7 @@ func (cache *cacheImpl) AddPod(logger klog.Logger, pod *v1.Pod) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
-	ps, assumed, found, _ := cache.podStateStore.Get(context.TODO(), key)
+	ps, _, assumed, found, _ := cache.podStateStore.Get(context.TODO(), key)
 
 	switch {
 	case found && assumed:
@@ -671,7 +632,7 @@ func (cache *cacheImpl) AddPod(logger klog.Logger, pod *v1.Pod) error {
 	return nil
 }
 
-func (cache *cacheImpl) UpdatePod(logger klog.Logger, oldPod, newPod *v1.Pod) error {
+func (cache *CacheImpl) UpdatePod(logger klog.Logger, oldPod, newPod *v1.Pod) error {
 	key, err := framework.GetPodKey(oldPod)
 	if err != nil {
 		return err
@@ -680,7 +641,7 @@ func (cache *cacheImpl) UpdatePod(logger klog.Logger, oldPod, newPod *v1.Pod) er
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
-	ps, assumed, found, _ := cache.podStateStore.Get(context.Background(), key)
+	ps, _, assumed, found, _ := cache.podStateStore.Get(context.Background(), key)
 	if !found {
 		return fmt.Errorf("pod %v(%v) is not added to scheduler cache, so cannot be updated",
 			key, klog.KObj(oldPod))
@@ -707,7 +668,7 @@ func (cache *cacheImpl) UpdatePod(logger klog.Logger, oldPod, newPod *v1.Pod) er
 	return cache.updatePod(logger, oldPod, newPod)
 }
 
-func (cache *cacheImpl) RemovePod(logger klog.Logger, pod *v1.Pod) error {
+func (cache *CacheImpl) RemovePod(logger klog.Logger, pod *v1.Pod) error {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return err
@@ -716,7 +677,7 @@ func (cache *cacheImpl) RemovePod(logger klog.Logger, pod *v1.Pod) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
-	ps, _, found, _ := cache.podStateStore.Get(context.Background(), key)
+	ps, _, _, found, _ := cache.podStateStore.Get(context.Background(), key)
 	if !found {
 		return fmt.Errorf("pod %v(%v) is not found in scheduler cache, so cannot be removed",
 			key, klog.KObj(pod))
@@ -735,7 +696,7 @@ func (cache *cacheImpl) RemovePod(logger klog.Logger, pod *v1.Pod) error {
 	return cache.removePod(logger, ps.Pod)
 }
 
-func (cache *cacheImpl) IsAssumedPod(pod *v1.Pod) (bool, error) {
+func (cache *CacheImpl) IsAssumedPod(pod *v1.Pod) (bool, error) {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return false, err
@@ -744,7 +705,7 @@ func (cache *cacheImpl) IsAssumedPod(pod *v1.Pod) (bool, error) {
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
 
-	_, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
+	_, _, assumed, found, err := cache.podStateStore.Get(context.Background(), key)
 	if err != nil || !found {
 		return false, err
 	}
@@ -754,7 +715,7 @@ func (cache *cacheImpl) IsAssumedPod(pod *v1.Pod) (bool, error) {
 
 // GetPod might return a pod for which its node has already been deleted from
 // the main cache. This is useful to properly process pod update events.
-func (cache *cacheImpl) GetPod(pod *v1.Pod) (*v1.Pod, error) {
+func (cache *CacheImpl) GetPod(pod *v1.Pod) (*v1.Pod, error) {
 	key, err := framework.GetPodKey(pod)
 	if err != nil {
 		return nil, err
@@ -769,16 +730,18 @@ func (cache *cacheImpl) GetPod(pod *v1.Pod) (*v1.Pod, error) {
 	//}
 	//
 	//return podState.pod, nil
-	ps, _, found, _ := cache.podStateStore.Get(context.Background(), key)
+	ps, _, _, found, _ := cache.podStateStore.Get(context.Background(), key)
 	if !found {
 		return nil, fmt.Errorf("pod %v(%v) does not exist in scheduler cache", key, klog.KObj(pod))
 	}
 	return ps.Pod, nil
 }
 
-func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.NodeInfo {
+func (cache *CacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.NodeInfo {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+
+	logger.V(4).Info("Adding node to cache", "node", klog.KObj(node))
 
 	//n, ok := cache.nodes[node.Name]
 	//if !ok {
@@ -809,9 +772,11 @@ func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) *framework.No
 	return ni.Snapshot()
 }
 
-func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node) *framework.NodeInfo {
+func (cache *CacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node) *framework.NodeInfo {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
+
+	logger.V(4).Info("Updating node in cache", "node", klog.KObj(newNode))
 
 	//n, ok := cache.nodes[newNode.Name]
 	//if !ok {
@@ -849,7 +814,7 @@ func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node
 // the source of truth.
 // However, we keep a ghost node with the list of pods until all pod deletion
 // events have arrived. A ghost node is skipped from snapshots.
-func (cache *cacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
+func (cache *CacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
@@ -895,7 +860,7 @@ func (cache *cacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
 	return nil
 }
 
-func (cache *cacheImpl) run(logger klog.Logger) {
+func (cache *CacheImpl) run(logger klog.Logger) {
 	go wait.Until(func() {
 		cache.cleanupAssumedPods(logger, time.Now())
 	}, cache.period, cache.stop)
@@ -903,7 +868,7 @@ func (cache *cacheImpl) run(logger klog.Logger) {
 
 // cleanupAssumedPods exists for making test deterministic by taking time as input argument.
 // It also reports metrics on the cache size for nodes, pods, and assumed pods.
-func (cache *cacheImpl) cleanupAssumedPods(logger klog.Logger, now time.Time) {
+func (cache *CacheImpl) cleanupAssumedPods(logger klog.Logger, now time.Time) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	//defer cache.updateMetrics()

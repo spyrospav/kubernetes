@@ -19,11 +19,12 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"k8s.io/kubernetes/pkg/scheduler/awsstore"
-	"sync"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -144,7 +145,8 @@ func newBackoffQueueWithBackend(
 			awsCfg,
 			backoffConfig,
 			[]func(*dynamodb.Options){localOpt},
-			nil)
+			nil,
+			false)
 		if err != nil {
 			panic(fmt.Sprintf("failed to create backoffQ: %v", err))
 		}
@@ -165,7 +167,8 @@ func newBackoffQueueWithBackend(
 			awsCfg,
 			errorConfig,
 			[]func(*dynamodb.Options){localOpt},
-			nil)
+			nil,
+			false)
 		if err != nil {
 			panic(fmt.Sprintf("failed to create errorBackoffQ: %v", err))
 		}
@@ -368,9 +371,13 @@ func (bq *backoffQueue) add(logger klog.Logger, pInfo *framework.QueuedPodInfo, 
 	// If pod has empty both unschedulable plugins and pending plugins,
 	// it means that it failed because of error and should be moved to podErrorBackoffQ.
 	if pInfo.UnschedulablePlugins.Len() == 0 && pInfo.PendingPlugins.Len() == 0 {
-		bq.podErrorBackoffQ.AddOrUpdate(pInfo)
+		err := bq.podErrorBackoffQ.AddOrUpdate(pInfo)
+		if err != nil {
+			logger.Error(err, "BackoffQueue add() failed to add pod to podErrorBackoffQ", "pod", klog.KObj(pInfo.Pod))
+			return
+		}
 		// Ensure the pod is not in the podBackoffQ and report the error if it happens.
-		err := bq.podBackoffQ.Delete(pInfo)
+		err = bq.podBackoffQ.Delete(pInfo)
 		if err == nil {
 			logger.Error(nil, "BackoffQueue add() was called with a pod that was already in the podBackoffQ", "pod", klog.KObj(pInfo.Pod))
 			return
@@ -378,12 +385,16 @@ func (bq *backoffQueue) add(logger klog.Logger, pInfo *framework.QueuedPodInfo, 
 		metrics.SchedulerQueueIncomingPods.WithLabelValues("backoff", event).Inc()
 		return
 	}
-	bq.podBackoffQ.AddOrUpdate(pInfo)
+	err := bq.podBackoffQ.AddOrUpdate(pInfo)
+	if err != nil {
+		logger.Error(err, "BackoffQueue add() failed to add pod to podBackoffQ", "pod", klog.KObj(pInfo.Pod))
+		return
+	}
 
 	logger.V(4).Info("Adding pod to backoff queue")
 
 	// Ensure the pod is not in the podErrorBackoffQ and report the error if it happens.
-	err := bq.podErrorBackoffQ.Delete(pInfo)
+	err = bq.podErrorBackoffQ.Delete(pInfo)
 	if err == nil {
 		logger.Error(nil, "BackoffQueue add() was called with a pod that was already in the podErrorBackoffQ", "pod", klog.KObj(pInfo.Pod))
 		return
@@ -400,13 +411,21 @@ func (bq *backoffQueue) update(newPod *v1.Pod, oldPodInfo *framework.QueuedPodIn
 	// If the pod is in the backoff queue, update it there.
 	if pInfo, exists := bq.podBackoffQ.Get(oldPodInfo); exists {
 		_ = pInfo.Update(newPod)
-		bq.podBackoffQ.AddOrUpdate(pInfo)
+		err := bq.podBackoffQ.AddOrUpdate(pInfo)
+		if err != nil {
+			klog.Error(err, "BackoffQueue update() failed to update pod in podBackoffQ", "pod", klog.KObj(newPod))
+			return nil
+		}
 		return pInfo
 	}
 	// If the pod is in the error backoff queue, update it there.
 	if pInfo, exists := bq.podErrorBackoffQ.Get(oldPodInfo); exists {
 		_ = pInfo.Update(newPod)
-		bq.podErrorBackoffQ.AddOrUpdate(pInfo)
+		err := bq.podErrorBackoffQ.AddOrUpdate(pInfo)
+		if err != nil {
+			klog.Error(err, "BackoffQueue update() failed to update pod in podErrorBackoffQ", "pod", klog.KObj(newPod))
+			return nil
+		}
 		return pInfo
 	}
 	return nil

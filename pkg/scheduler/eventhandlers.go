@@ -187,7 +187,7 @@ func (sched *Scheduler) deletePodFromSchedulingQueue(obj interface{}) {
 
 	logger.V(3).Info("Delete event for unscheduled pod", "pod", klog.KObj(pod))
 	sched.SchedulingQueue.Delete(pod)
-	fwk, err := sched.frameworkForPod(pod)
+	fwk, err := sched.FrameworkForPod(pod)
 	if err != nil {
 		// This shouldn't happen, because we only accept for scheduling the pods
 		// which specify a scheduler name that matches one of the profiles.

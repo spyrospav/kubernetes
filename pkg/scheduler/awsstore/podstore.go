@@ -2,6 +2,7 @@ package awsstore
 
 import (
 	"context"
+
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
@@ -11,6 +12,7 @@ type PodStore interface {
 	Get(key string) (*framework.QueuedPodInfo, bool, error)
 	Clear() error
 	List() ([]*framework.QueuedPodInfo, error)
+	ListWithKeys() (map[string]*framework.QueuedPodInfo, error)
 }
 
 //
@@ -58,6 +60,14 @@ func (s *MapStore) List() ([]*framework.QueuedPodInfo, error) {
 	return out, nil
 }
 
+func (s *MapStore) ListWithKeys() (map[string]*framework.QueuedPodInfo, error) {
+	out := make(map[string]*framework.QueuedPodInfo, len(s.store))
+	for k, v := range s.store {
+		out[k] = v
+	}
+	return out, nil
+}
+
 //
 // ---------------------------  DynamoDB adapter  --------------------------- //
 //
@@ -85,7 +95,7 @@ func (s *DDBPodStore) Delete(key string) error {
 }
 
 func (s *DDBPodStore) Get(key string) (*framework.QueuedPodInfo, bool, error) {
-	b, ok, err := s.ps.Get(s.ctx, key)
+	b, _, ok, err := s.ps.Get(s.ctx, key)
 	if err != nil || !ok {
 		return nil, ok, err
 	}
@@ -112,6 +122,22 @@ func (s *DDBPodStore) List() ([]*framework.QueuedPodInfo, error) {
 			return nil, err
 		}
 		out = append(out, q)
+	}
+	return out, nil
+}
+
+func (s *DDBPodStore) ListWithKeys() (map[string]*framework.QueuedPodInfo, error) {
+	raw, err := s.ps.List(s.ctx) // returns map[string][]byte
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]*framework.QueuedPodInfo, len(raw))
+	for k, b := range raw {
+		q, err := UnmarshalQueuedPodInfo(b)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = q
 	}
 	return out, nil
 }

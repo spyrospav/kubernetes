@@ -19,11 +19,12 @@ package queue
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"k8s.io/kubernetes/pkg/scheduler/backend/heap"
-	"sync"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -92,7 +93,11 @@ func newUnlockedActiveQueue(queue awsstore.PodQueue) *unlockedActiveQueue {
 // The event should show which event triggered this addition and is used for the metric recording.
 // This method should be called in activeQueue.underLock().
 func (uaq *unlockedActiveQueue) add(pInfo *framework.QueuedPodInfo, event string) {
-	uaq.queue.AddOrUpdate(pInfo)
+	err := uaq.queue.AddOrUpdate(pInfo)
+	if err != nil {
+		klog.ErrorS(err, "Failed to add pod to activeQ", "pod", klog.KObj(pInfo.Pod))
+		return
+	}
 	metrics.SchedulerQueueIncomingPods.WithLabelValues("active", event).Inc()
 }
 
@@ -182,7 +187,8 @@ func newActiveQueueWithBackend(
 			awsCfg,
 			activeConfig,
 			[]func(*dynamodb.Options){localOpt},
-			nil)
+			nil,
+			false)
 		if err != nil {
 			panic(fmt.Sprintf("activeQ AWS backend: %v", err))
 		}
@@ -235,7 +241,11 @@ func (aq *activeQueue) update(newPod *v1.Pod, oldPodInfo *framework.QueuedPodInf
 
 	if pInfo, exists := aq.queue.Get(oldPodInfo); exists {
 		_ = pInfo.Update(newPod)
-		aq.queue.AddOrUpdate(pInfo)
+		err := aq.queue.AddOrUpdate(pInfo)
+		if err != nil {
+			klog.ErrorS(err, "Failed to update pod in activeQ", "pod", klog.KObj(newPod))
+			return nil
+		}
 		return pInfo
 	}
 	return nil
@@ -253,9 +263,28 @@ func (aq *activeQueue) delete(pInfo *framework.QueuedPodInfo) error {
 // It blocks if the queue is empty and waits until a new item is added to the queue.
 // It increments scheduling cycle when a pod is popped.
 func (aq *activeQueue) pop(logger klog.Logger) (*framework.QueuedPodInfo, error) {
+	type nonBlocking interface {
+		Pop() (*framework.QueuedPodInfo, error) // must be non-blocking
+	}
+	if nb, ok := aq.queue.(nonBlocking); ok {
+		p, err := nb.Pop()
+		if err != nil || p == nil {
+			time.Sleep(150 * time.Millisecond)
+			return p, err
+		}
+		// mirror the book-keeping we used to do
+		p.Attempts++
+		p.BackoffExpiration = time.Time{}
+		aq.lock.Lock()
+		aq.schedCycle++
+		aq.lock.Unlock()
+		p.UnschedulablePlugins.Clear()
+		p.PendingPlugins.Clear()
+		return p, nil
+	}
+
 	aq.lock.Lock()
 	defer aq.lock.Unlock()
-
 	return aq.unlockedPop(logger)
 }
 
