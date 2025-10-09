@@ -22,7 +22,9 @@ import (
 	"sync/atomic"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
@@ -269,6 +271,62 @@ func (pl *InterPodAffinity) getIncomingAffinityAntiAffinityCounts(ctx context.Co
 	return affinityCounts, antiAffinityCounts
 }
 
+// gather unique, non-empty namespace selectors across both term sets
+func collectNamespaceSelectors(podInfo *framework.PodInfo) map[string]labels.Selector {
+	out := make(map[string]labels.Selector)
+
+	for i := range podInfo.RequiredAffinityTerms {
+		sel := podInfo.RequiredAffinityTerms[i].NamespaceSelector
+		if !sel.Empty() {
+			out[sel.String()] = sel
+		}
+	}
+	for i := range podInfo.RequiredAntiAffinityTerms {
+		sel := podInfo.RequiredAntiAffinityTerms[i].NamespaceSelector
+		if !sel.Empty() {
+			out[sel.String()] = sel
+		}
+	}
+	return out
+}
+
+// list namespaces once per unique selector
+func listNamespacesBySelector(
+	ctx context.Context,
+	client kubernetes.Interface,
+	selectors map[string]labels.Selector,
+) (map[string][]string, error) {
+	res := make(map[string][]string, len(selectors))
+	for k, sel := range selectors {
+		opts := metav1.ListOptions{LabelSelector: sel.String()}
+		nsList, err := client.CoreV1().Namespaces().List(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		names := make([]string, 0, len(nsList.Items))
+		for _, n := range nsList.Items {
+			names = append(names, n.Name)
+		}
+		res[k] = names
+	}
+	return res, nil
+}
+
+// apply the pre-fetched namespaces to a single term
+func expandTermNamespacesFromCache(at *framework.AffinityTerm, cache map[string][]string) {
+	if at.NamespaceSelector.Empty() {
+		return
+	}
+	key := at.NamespaceSelector.String()
+	if names, ok := cache[key]; ok {
+		for _, name := range names {
+			at.Namespaces.Insert(name)
+		}
+		// selector has been unrolled into Namespaces
+		at.NamespaceSelector = labels.Nothing()
+	}
+}
+
 // PreFilter invoked at the prefilter extension point.
 func (pl *InterPodAffinity) PreFilter(ctx context.Context, cycleState *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	var allNodes []*framework.NodeInfo
@@ -287,23 +345,32 @@ func (pl *InterPodAffinity) PreFilter(ctx context.Context, cycleState *framework
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, fmt.Sprintf("parsing pod: %+v", err))
 	}
 
+	// 1) collect unique selectors up-front
+	selectorSet := collectNamespaceSelectors(s.podInfo)
+
+	// 2) list namespaces once per unique selector
+	nsCache, err := listNamespacesBySelector(ctx, pl.client, selectorSet)
+	if err != nil {
+		return nil, framework.AsStatus(err)
+	}
+
+	// 3) expand terms using the cache (no API calls inside these loops)
 	for i := range s.podInfo.RequiredAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(ctx, &s.podInfo.RequiredAffinityTerms[i]); err != nil {
-			return nil, framework.AsStatus(err)
-		}
+		expandTermNamespacesFromCache(&s.podInfo.RequiredAffinityTerms[i], nsCache)
 	}
 	for i := range s.podInfo.RequiredAntiAffinityTerms {
-		if err := pl.mergeAffinityTermNamespacesIfNotEmpty(ctx, &s.podInfo.RequiredAntiAffinityTerms[i]); err != nil {
-			return nil, framework.AsStatus(err)
-		}
+		expandTermNamespacesFromCache(&s.podInfo.RequiredAntiAffinityTerms[i], nsCache)
 	}
+
 	logger := klog.FromContext(ctx)
 	s.namespaceLabels = GetNamespaceLabelsSnapshot(ctx, logger, pod.Namespace, pl.client)
 
 	s.existingAntiAffinityCounts = pl.getExistingAntiAffinityCounts(ctx, pod, s.namespaceLabels, nodesWithRequiredAntiAffinityPods)
 	s.affinityCounts, s.antiAffinityCounts = pl.getIncomingAffinityAntiAffinityCounts(ctx, s.podInfo, allNodes)
 
-	if len(s.existingAntiAffinityCounts) == 0 && len(s.podInfo.RequiredAffinityTerms) == 0 && len(s.podInfo.RequiredAntiAffinityTerms) == 0 {
+	if len(s.existingAntiAffinityCounts) == 0 &&
+		len(s.podInfo.RequiredAffinityTerms) == 0 &&
+		len(s.podInfo.RequiredAntiAffinityTerms) == 0 {
 		return nil, framework.NewStatus(framework.Skip)
 	}
 
