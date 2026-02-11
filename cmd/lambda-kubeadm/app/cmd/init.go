@@ -20,6 +20,7 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	phases "k8s.io/kubernetes/cmd/lambda-kubeadm/app/cmd/phases/init"
 )
@@ -28,11 +29,12 @@ import (
 var _ phases.InitData = &initData{}
 
 type initData struct {
-	cfgYaml string
+	templatePath string
 }
 
-
-type initOptions struct{}
+type initOptions struct {
+	templatePath string
+}
 
 // newCmdInit returns a stub init command for lambda-kubeadm.
 func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
@@ -44,17 +46,21 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 		Use:   "init",
 		Short: "Initialize a serverless Kubernetes control plane",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return nil
+			return initRunner.Run(args)
 		},
 	}
+	cmd.Flags().StringVar(&initOptions.templatePath, "template-path", "template.yaml", "Path to write the SAM template file")
 	cmd.SetOut(out)
 	initRunner.AppendPhase(phases.NewPreflightPhase())
 	initRunner.AppendPhase(phases.NewCertsPhase())
+	initRunner.AppendPhase(phases.NewAPIServerPhase())
+	initRunner.AppendPhase(phases.NewControllerManagerPhase())
+	initRunner.AppendPhase(phases.NewSchedulerPhase())
 
 
 	// set the data in the runner
 	initRunner.SetDataInitializer(func(cmd *cobra.Command, args []string) (workflow.RunData, error) {
-		return newInitData(), nil
+		return newInitData(cmd, args, initOptions), nil
 	})
 
 	initRunner.BindToCommand(cmd)
@@ -62,15 +68,25 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 }
 
 func newInitOptions() *initOptions {
-	return &initOptions{}
-}
-
-func newInitData() phases.InitData {
-	return &initData{
-		cfgYaml: "",
+	return &initOptions{
+		templatePath: "template.yaml",
 	}
 }
 
-func (d *initData) CfgYaml() string {
-	return d.cfgYaml
+func newInitData(cmd *cobra.Command, args []string, initOptions *initOptions) phases.InitData {
+	// print cmd and args for debugging
+	klog.V(2).Infoln("[initData] cmd: ", cmd)
+	klog.V(2).Infoln("[initData] args: ", args)
+	templatePath, err := cmd.Flags().GetString("template-path")
+	if err != nil {
+		klog.V(0).Infoln("[initData] Error getting template-path flag: ", err)
+		templatePath = initOptions.templatePath
+	}
+	return &initData{
+		templatePath: templatePath,
+	}
+}
+
+func (d *initData) TemplatePath() string {
+	return d.templatePath
 }

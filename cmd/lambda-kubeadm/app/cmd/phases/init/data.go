@@ -19,5 +19,5 @@ package phases
 // InitData is the interface to use for init phases.
 // The "initData" type from "cmd/init.go" must satisfy this interface.
 type InitData interface {
-	CfgYaml() string
+	TemplatePath() string
 }
