@@ -21,9 +21,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,6 +64,35 @@ import (
 	rbacrest "k8s.io/kubernetes/pkg/registry/rbac/rest"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 )
+
+type perResourceTableRESTOptionsGetter struct {
+	delegate  genericregistry.RESTOptionsGetter
+	baseTable string
+}
+
+func sanitize(s string) string {
+	// Dynamo table names allow a bunch, but keep it simple.
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, ".", "_")
+	return s
+}
+
+func (g perResourceTableRESTOptionsGetter) GetRESTOptions(
+	gr schema.GroupResource,
+	obj runtime.Object,
+) (genericregistry.RESTOptions, error) {
+	opts, err := g.delegate.GetRESTOptions(gr, obj)
+	if err != nil {
+		return opts, err
+	}
+
+	if opts.StorageConfig.Type == storagebackend.StorageTypeDynamo {
+		opts.StorageConfig.Dynamo.TableName =
+			fmt.Sprintf("%s-%s-%s", g.baseTable, sanitize(gr.Group), sanitize(gr.Resource))
+	}
+
+	return opts, nil
+}
 
 // Config defines configuration for the master
 type Config struct {
@@ -201,6 +234,11 @@ func BuildGenericConfig(
 	storageFactory.StorageConfig.StorageObjectCountTracker = genericConfig.StorageObjectCountTracker
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
+	}
+
+	genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
+		delegate:  genericConfig.RESTOptionsGetter,
+		baseTable: "...",
 	}
 
 	ctx := wait.ContextForChannel(genericConfig.DrainedNotify())
