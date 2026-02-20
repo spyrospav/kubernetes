@@ -77,6 +77,15 @@ func sanitize(s string) string {
 	return s
 }
 
+func tableName(base string, gr schema.GroupResource) string {
+	group := sanitize(gr.Group)
+	if group == "" {
+		group = "core"
+	}
+	res := sanitize(gr.Resource)
+	return fmt.Sprintf("%s-%s-%s", base, group, res)
+}
+
 func (g perResourceTableRESTOptionsGetter) GetRESTOptions(
 	gr schema.GroupResource,
 	obj runtime.Object,
@@ -87,8 +96,7 @@ func (g perResourceTableRESTOptionsGetter) GetRESTOptions(
 	}
 
 	if opts.StorageConfig.Type == storagebackend.StorageTypeDynamo {
-		opts.StorageConfig.Dynamo.TableName =
-			fmt.Sprintf("%s-%s-%s", g.baseTable, sanitize(gr.Group), sanitize(gr.Resource))
+		opts.StorageConfig.Dynamo.TableName = tableName(g.baseTable, gr)
 	}
 
 	return opts, nil
@@ -238,7 +246,7 @@ func BuildGenericConfig(
 
 	genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
 		delegate:  genericConfig.RESTOptionsGetter,
-		baseTable: "...",
+		baseTable: s.Etcd.StorageConfig.Dynamo.TableName,
 	}
 
 	ctx := wait.ContextForChannel(genericConfig.DrainedNotify())
