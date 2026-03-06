@@ -92,6 +92,15 @@ type Options struct {
 	SystemNamespaces []string
 
 	ServiceAccountSigningEndpoint string
+
+	CustomStorage CustomStorageOptions
+}
+
+type CustomStorageOptions struct {
+	Backend        string
+	DynamoRegion   string
+	DynamoTable    string
+	DynamoEndpoint string
 }
 
 // completedServerRunOptions is a private wrapper that enforces a call of Complete() before Run can be invoked.
@@ -125,6 +134,13 @@ func NewOptions() *Options {
 		EventTTL:                            1 * time.Hour,
 		AggregatorRejectForwardingRedirects: true,
 		SystemNamespaces:                    []string{metav1.NamespaceSystem, metav1.NamespacePublic, metav1.NamespaceDefault},
+
+		CustomStorage: CustomStorageOptions{
+			Backend:        "etcd",
+			DynamoRegion:   "us-east-1",
+			DynamoTable:    "dynamo",
+			DynamoEndpoint: "http://dynamodb-local:8000",
+		},
 	}
 
 	// Overwrite the default for storage data format.
@@ -148,6 +164,19 @@ func (s *Options) AddFlags(fss *cliflag.NamedFlagSets) {
 	s.Metrics.AddFlags(fss.FlagSet("metrics"))
 	logsapi.AddFlags(s.Logs, fss.FlagSet("logs"))
 	s.Traces.AddFlags(fss.FlagSet("traces"))
+
+	storageFS := fss.FlagSet("storage")
+	storageFS.StringVar(&s.CustomStorage.Backend, "storage-backend", s.CustomStorage.Backend,
+		"Storage backend to use for kube-apiserver. Supported values: etcd, dynamo.")
+
+	storageFS.StringVar(&s.CustomStorage.DynamoRegion, "dynamo-region", s.CustomStorage.DynamoRegion,
+		"AWS region for the DynamoDB storage backend.")
+
+	storageFS.StringVar(&s.CustomStorage.DynamoTable, "dynamo-table", s.CustomStorage.DynamoTable,
+		"Base table name for the DynamoDB storage backend.")
+
+	storageFS.StringVar(&s.CustomStorage.DynamoEndpoint, "dynamo-endpoint", s.CustomStorage.DynamoEndpoint,
+		"Custom endpoint for the DynamoDB storage backend.")
 
 	// Note: the weird ""+ in below lines seems to be the only way to get gofmt to
 	// arrange these text blocks sensibly. Grrr.
@@ -213,6 +242,10 @@ func (o *Options) Complete(ctx context.Context, alternateDNS []string, alternate
 		Options: *o,
 	}
 
+	if err := o.applyCustomStorage(&completed); err != nil {
+		return CompletedOptions{}, err
+	}
+
 	if err := completed.GenericServerRunOptions.Complete(); err != nil {
 		return CompletedOptions{}, err
 	}
@@ -273,6 +306,30 @@ func (o *Options) Complete(ctx context.Context, alternateDNS []string, alternate
 	return CompletedOptions{
 		completedOptions: &completed,
 	}, nil
+}
+
+func (o *Options) applyCustomStorage(completed *completedOptions) error {
+	switch completed.CustomStorage.Backend {
+	case "", "etcd":
+		// Default/original behavior.
+		// Leave existing etcd settings and flags untouched.
+		return nil
+
+	case "dynamo":
+		completed.Etcd.StorageConfig.Type = storagebackend.StorageTypeDynamo
+		completed.Etcd.StorageConfig.Dynamo.Region = completed.CustomStorage.DynamoRegion
+		completed.Etcd.StorageConfig.Dynamo.TableName = completed.CustomStorage.DynamoTable
+		completed.Etcd.StorageConfig.Dynamo.Endpoint = completed.CustomStorage.DynamoEndpoint
+
+		// Backend-specific behavior that we may want
+		completed.Etcd.EnableWatchCache = false
+		completed.Etcd.SkipHealthEndpoints = true
+
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported --storage-backend %q, supported values are: etcd, dynamo", completed.CustomStorage.Backend)
+	}
 }
 
 func (o *Options) completeServiceAccountOptions(ctx context.Context, completed *completedOptions) error {

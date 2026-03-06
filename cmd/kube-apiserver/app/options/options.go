@@ -24,7 +24,6 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	"k8s.io/apiserver/pkg/storage/storagebackend"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -93,13 +92,6 @@ func NewServerRunOptions() *ServerRunOptions {
 	}
 
 	s.Options.SystemNamespaces = append(s.Options.SystemNamespaces, v1.NamespaceNodeLease)
-
-	s.Options.Etcd.StorageConfig.Type = storagebackend.StorageTypeDynamo
-	s.Options.Etcd.StorageConfig.Dynamo.Region = "us-east-1"
-	s.Options.Etcd.StorageConfig.Dynamo.TableName = "dynamo"
-	s.Options.Etcd.StorageConfig.Dynamo.Endpoint = "http://dynamodb-local:8000"
-	s.Options.Etcd.EnableWatchCache = false
-	s.Options.Etcd.SkipHealthEndpoints = true
 
 	return &s
 }

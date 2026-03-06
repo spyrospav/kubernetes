@@ -117,6 +117,29 @@ func validateServiceAccountTokenSigningConfig(options *Options) []error {
 	return errors
 }
 
+func (s *Options) validateCustomStorage() []error {
+	var errs []error
+
+	switch s.CustomStorage.Backend {
+	case "", "etcd":
+		// ok
+	case "dynamo":
+		if len(s.CustomStorage.DynamoRegion) == 0 {
+			errs = append(errs, fmt.Errorf("--dynamo-region must be set when --storage-backend=dynamo"))
+		}
+		if len(s.CustomStorage.DynamoTable) == 0 {
+			errs = append(errs, fmt.Errorf("--dynamo-table must be set when --storage-backend=dynamo"))
+		}
+		if len(s.CustomStorage.DynamoEndpoint) == 0 {
+			errs = append(errs, fmt.Errorf("--dynamo-endpoint must be set when --storage-backend=dynamo"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("unsupported --storage-backend %q, supported values are: etcd, dynamo", s.CustomStorage.Backend))
+	}
+
+	return errs
+}
+
 // Validate checks Options and return a slice of found errs.
 func (s *Options) Validate() []error {
 	var errs []error
@@ -135,6 +158,8 @@ func (s *Options) Validate() []error {
 	errs = append(errs, validateUnknownVersionInteroperabilityProxyFlags(s)...)
 	errs = append(errs, validateNodeSelectorAuthorizationFeature()...)
 	errs = append(errs, validateServiceAccountTokenSigningConfig(s)...)
+
+	errs = append(errs, s.validateCustomStorage()...)
 
 	return errs
 }

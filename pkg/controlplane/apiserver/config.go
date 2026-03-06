@@ -244,9 +244,11 @@ func BuildGenericConfig(
 		return
 	}
 
-	genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
-		delegate:  genericConfig.RESTOptionsGetter,
-		baseTable: s.Etcd.StorageConfig.Dynamo.TableName,
+	if s.CustomStorage.Backend == "dynamo" {
+		genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
+			delegate:  genericConfig.RESTOptionsGetter,
+			baseTable: s.Etcd.StorageConfig.Dynamo.TableName,
+		}
 	}
 
 	ctx := wait.ContextForChannel(genericConfig.DrainedNotify())
