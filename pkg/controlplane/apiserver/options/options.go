@@ -97,7 +97,6 @@ type Options struct {
 }
 
 type CustomStorageOptions struct {
-	Backend        string
 	DynamoRegion   string
 	DynamoTable    string
 	DynamoEndpoint string
@@ -136,10 +135,9 @@ func NewOptions() *Options {
 		SystemNamespaces:                    []string{metav1.NamespaceSystem, metav1.NamespacePublic, metav1.NamespaceDefault},
 
 		CustomStorage: CustomStorageOptions{
-			Backend:        "etcd",
-			DynamoRegion:   "us-east-1",
-			DynamoTable:    "dynamo",
-			DynamoEndpoint: "http://dynamodb-local:8000",
+			DynamoRegion:   "",
+			DynamoTable:    "",
+			DynamoEndpoint: "",
 		},
 	}
 
@@ -152,7 +150,13 @@ func NewOptions() *Options {
 func (s *Options) AddFlags(fss *cliflag.NamedFlagSets) {
 	// Add the generic flags.
 	s.GenericServerRunOptions.AddUniversalFlags(fss.FlagSet("generic"))
-	s.Etcd.AddFlags(fss.FlagSet("etcd"))
+
+	etcdFS := fss.FlagSet("etcd")
+	s.Etcd.AddFlags(etcdFS)
+	if f := etcdFS.Lookup("storage-backend"); f != nil {
+		f.Usage = "The storage backend for persistence. Supported values: etcd3 (default), dynamo."
+	}
+
 	s.SecureServing.AddFlags(fss.FlagSet("secure serving"))
 	s.Audit.AddFlags(fss.FlagSet("auditing"))
 	s.Features.AddFlags(fss.FlagSet("features"))
@@ -166,17 +170,15 @@ func (s *Options) AddFlags(fss *cliflag.NamedFlagSets) {
 	s.Traces.AddFlags(fss.FlagSet("traces"))
 
 	storageFS := fss.FlagSet("storage")
-	storageFS.StringVar(&s.CustomStorage.Backend, "storage-backend", s.CustomStorage.Backend,
-		"Storage backend to use for kube-apiserver. Supported values: etcd, dynamo.")
 
 	storageFS.StringVar(&s.CustomStorage.DynamoRegion, "dynamo-region", s.CustomStorage.DynamoRegion,
-		"AWS region for the DynamoDB storage backend.")
+		"AWS region for the DynamoDB storage backend. Required when --storage-backend=dynamo.")
 
 	storageFS.StringVar(&s.CustomStorage.DynamoTable, "dynamo-table", s.CustomStorage.DynamoTable,
-		"Base table name for the DynamoDB storage backend.")
+		"Base table name for the DynamoDB storage backend. Required when --storage-backend=dynamo.")
 
 	storageFS.StringVar(&s.CustomStorage.DynamoEndpoint, "dynamo-endpoint", s.CustomStorage.DynamoEndpoint,
-		"Custom endpoint for the DynamoDB storage backend.")
+		"Custom DynamoDB endpoint. Optional when --storage-backend=dynamo. Leave empty to use AWS-managed DynamoDB in --dynamo-region.")
 
 	// Note: the weird ""+ in below lines seems to be the only way to get gofmt to
 	// arrange these text blocks sensibly. Grrr.
@@ -309,26 +311,25 @@ func (o *Options) Complete(ctx context.Context, alternateDNS []string, alternate
 }
 
 func (o *Options) applyCustomStorage(completed *completedOptions) error {
-	switch completed.CustomStorage.Backend {
-	case "", "etcd":
-		// Default/original behavior.
-		// Leave existing etcd settings and flags untouched.
+	switch selectedStorageBackend(&completed.Options) {
+	case "etcd":
+		if completed.Etcd.StorageConfig.Type == "" {
+			completed.Etcd.StorageConfig.Type = storagebackend.StorageTypeETCD3
+		}
 		return nil
 
 	case "dynamo":
 		completed.Etcd.StorageConfig.Type = storagebackend.StorageTypeDynamo
-		completed.Etcd.StorageConfig.Dynamo.Region = completed.CustomStorage.DynamoRegion
-		completed.Etcd.StorageConfig.Dynamo.TableName = completed.CustomStorage.DynamoTable
-		completed.Etcd.StorageConfig.Dynamo.Endpoint = completed.CustomStorage.DynamoEndpoint
+		completed.Etcd.StorageConfig.Dynamo.Region = strings.TrimSpace(completed.CustomStorage.DynamoRegion)
+		completed.Etcd.StorageConfig.Dynamo.TableName = strings.TrimSpace(completed.CustomStorage.DynamoTable)
+		completed.Etcd.StorageConfig.Dynamo.Endpoint = strings.TrimSpace(completed.CustomStorage.DynamoEndpoint)
 
-		// Backend-specific behavior that we may want
 		completed.Etcd.EnableWatchCache = false
 		completed.Etcd.SkipHealthEndpoints = true
-
 		return nil
 
 	default:
-		return fmt.Errorf("unsupported --storage-backend %q, supported values are: etcd, dynamo", completed.CustomStorage.Backend)
+		return fmt.Errorf("unsupported --storage-backend %q, supported values are: etcd3, dynamo", selectedStorageBackend(&completed.Options))
 	}
 }
 

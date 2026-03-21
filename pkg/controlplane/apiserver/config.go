@@ -244,7 +244,8 @@ func BuildGenericConfig(
 		return
 	}
 
-	if s.CustomStorage.Backend == "dynamo" {
+	backend := strings.TrimSpace(s.Etcd.StorageConfig.Type)
+	if backend == storagebackend.StorageTypeDynamo {
 		genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
 			delegate:  genericConfig.RESTOptionsGetter,
 			baseTable: s.Etcd.StorageConfig.Dynamo.TableName,
