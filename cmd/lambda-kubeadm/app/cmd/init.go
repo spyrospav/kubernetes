@@ -53,6 +53,7 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 	cmd.SetOut(out)
 	initRunner.AppendPhase(phases.NewPreflightPhase())
 	initRunner.AppendPhase(phases.NewCertsPhase())
+	initRunner.AppendPhase(phases.NewDynamoDBPhase())
 	initRunner.AppendPhase(phases.NewAPIServerPhase())
 	initRunner.AppendPhase(phases.NewControllerManagerPhase())
 	initRunner.AppendPhase(phases.NewSchedulerPhase())
