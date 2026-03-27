@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	StorageTypeUnset = ""
-	StorageTypeETCD2 = "etcd2"
-	StorageTypeETCD3 = "etcd3"
+	StorageTypeUnset  = ""
+	StorageTypeETCD2  = "etcd2"
+	StorageTypeETCD3  = "etcd3"
+	StorageTypeDynamo = "dynamo"
 
 	DefaultCompactInterval      = 5 * time.Minute
 	DefaultDBMetricPollInterval = 30 * time.Second
@@ -41,6 +42,17 @@ const (
 	DefaultHealthcheckTimeout   = 2 * time.Second
 	DefaultReadinessTimeout     = 2 * time.Second
 )
+
+type DynamoDBConfig struct {
+	// AWS region used for signing and endpoint resolution.
+	Region string
+	// override for local testing (dynamodb-local / localstack).
+	Endpoint string
+	// backing table name used by your dynamo storage implementation.
+	TableName string
+	// allow choosing a shared config profile when running locally.
+	Profile string
+}
 
 // TransportConfig holds all connection related info,  i.e. equal TransportConfig means equal servers we talk to.
 type TransportConfig struct {
@@ -93,6 +105,8 @@ type Config struct {
 	// StorageObjectCountTracker is used to keep track of the total
 	// number of objects in the storage per resource.
 	StorageObjectCountTracker flowcontrolrequest.StorageObjectCountTracker
+
+	Dynamo DynamoDBConfig
 }
 
 // ConfigForResource is a Config specialized to a particular `schema.GroupResource`
@@ -123,5 +137,11 @@ func NewDefaultConfig(prefix string, codec runtime.Codec) *Config {
 		ReadycheckTimeout:    DefaultReadinessTimeout,
 		LeaseManagerConfig:   etcd3.NewDefaultLeaseManagerConfig(),
 		Transport:            TransportConfig{TracerProvider: noopoteltrace.NewTracerProvider()},
+		Dynamo: DynamoDBConfig{
+			Region:    "",
+			Endpoint:  "",
+			TableName: "",
+			Profile:   "",
+		},
 	}
 }

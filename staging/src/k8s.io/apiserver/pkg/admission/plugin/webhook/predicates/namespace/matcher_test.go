@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook"
-	"k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/namespace"
 )
 
 type fakeNamespaceLister struct {
@@ -101,7 +100,7 @@ func TestGetNamespaceLabels(t *testing.T) {
 			expectedLabels: namespace1Labels,
 		},
 	}
-	matcher := namespace.Matcher{
+	matcher := Matcher{
 		NamespaceLister: namespaceLister,
 	}
 	for _, tt := range tests {
@@ -120,7 +119,7 @@ func TestNotExemptClusterScopedResource(t *testing.T) {
 		NamespaceSelector: &metav1.LabelSelector{},
 	}
 	attr := admission.NewAttributesRecord(nil, nil, schema.GroupVersionKind{}, "", "mock-name", schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, "", admission.Create, &metav1.CreateOptions{}, false, nil)
-	matcher := namespace.Matcher{}
+	matcher := Matcher{}
 	matches, err := matcher.MatchNamespaceSelector(webhook.NewValidatingWebhookAccessor("mock-hook", "mock-cfg", hook), attr)
 	if err != nil {
 		t.Fatal(err)

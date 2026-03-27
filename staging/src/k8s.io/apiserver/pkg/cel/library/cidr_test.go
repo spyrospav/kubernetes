@@ -27,13 +27,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apiservercel "k8s.io/apiserver/pkg/cel"
-	"k8s.io/apiserver/pkg/cel/library"
 )
 
 func testCIDR(t *testing.T, expr string, expectResult ref.Val, expectRuntimeErr string, expectCompileErrs []string) {
 	env, err := cel.NewEnv(
-		library.IP(),
-		library.CIDR(),
+		IP(),
+		CIDR(),
 	)
 	if err != nil {
 		t.Fatalf("%v", err)

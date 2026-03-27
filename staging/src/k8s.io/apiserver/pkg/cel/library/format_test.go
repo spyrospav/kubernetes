@@ -24,7 +24,6 @@ import (
 	"github.com/google/cel-go/common/types/ref"
 
 	"k8s.io/apiserver/pkg/cel"
-	"k8s.io/apiserver/pkg/cel/library"
 )
 
 func TestFormat(t *testing.T) {
@@ -201,7 +200,7 @@ func TestFormat(t *testing.T) {
 	}
 
 	// Also test format names and comparisons of all constants
-	for keyLHS := range library.ConstantFormats {
+	for keyLHS := range ConstantFormats {
 		cases = append(cases, testcase{
 			name:        "lookup and comparison",
 			expr:        fmt.Sprintf(`format.named("%s").hasValue()`, keyLHS),
@@ -212,7 +211,7 @@ func TestFormat(t *testing.T) {
 			expectValue: types.True,
 		})
 
-		for keyRHS := range library.ConstantFormats {
+		for keyRHS := range ConstantFormats {
 			if keyLHS == keyRHS {
 				continue
 			}
@@ -232,7 +231,7 @@ func TestFormat(t *testing.T) {
 }
 
 func TestSizeLimit(t *testing.T) {
-	for name := range library.ConstantFormats {
+	for name := range ConstantFormats {
 		if len(name) > cel.MaxFormatSize {
 			t.Fatalf("All formats must be <= %d chars in length", cel.MaxFormatSize)
 		}

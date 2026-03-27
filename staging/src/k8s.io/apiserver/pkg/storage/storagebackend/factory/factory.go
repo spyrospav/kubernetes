@@ -31,9 +31,12 @@ type DestroyFunc func()
 
 // Create creates a storage backend based on given config.
 func Create(c storagebackend.ConfigForResource, newFunc, newListFunc func() runtime.Object, resourcePrefix string) (storage.Interface, DestroyFunc, error) {
+	fmt.Println("Choosing storage backend:", c.Type, "with prefix:", resourcePrefix)
 	switch c.Type {
 	case storagebackend.StorageTypeETCD2:
 		return nil, nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+	case storagebackend.StorageTypeDynamo:
+		return newDynamoStorage(c, newFunc, newListFunc, resourcePrefix)
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3Storage(c, newFunc, newListFunc, resourcePrefix)
 	default:
@@ -46,6 +49,8 @@ func CreateHealthCheck(c storagebackend.Config, stopCh <-chan struct{}) (func() 
 	switch c.Type {
 	case storagebackend.StorageTypeETCD2:
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+	case storagebackend.StorageTypeDynamo:
+		return nil, nil
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3HealthCheck(c, stopCh)
 	default:
@@ -57,6 +62,8 @@ func CreateReadyCheck(c storagebackend.Config, stopCh <-chan struct{}) (func() e
 	switch c.Type {
 	case storagebackend.StorageTypeETCD2:
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+	case storagebackend.StorageTypeDynamo:
+		return nil, nil
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ReadyCheck(c, stopCh)
 	default:
@@ -68,6 +75,8 @@ func CreateProber(c storagebackend.Config) (Prober, error) {
 	switch c.Type {
 	case storagebackend.StorageTypeETCD2:
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+	case storagebackend.StorageTypeDynamo:
+		return nil, nil
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ProberMonitor(c)
 	default:
@@ -79,6 +88,8 @@ func CreateMonitor(c storagebackend.Config) (metrics.Monitor, error) {
 	switch c.Type {
 	case storagebackend.StorageTypeETCD2:
 		return nil, fmt.Errorf("%s is no longer a supported storage backend", c.Type)
+	case storagebackend.StorageTypeDynamo:
+		return nil, nil
 	case storagebackend.StorageTypeUnset, storagebackend.StorageTypeETCD3:
 		return newETCD3ProberMonitor(c)
 	default:

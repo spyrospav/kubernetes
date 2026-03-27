@@ -6,10 +6,10 @@ godebug default=go1.24
 
 use (
 	.
-	./_local/apiserver
 	./staging/src/k8s.io/api
 	./staging/src/k8s.io/apiextensions-apiserver
 	./staging/src/k8s.io/apimachinery
+	./staging/src/k8s.io/apiserver
 	./staging/src/k8s.io/cli-runtime
 	./staging/src/k8s.io/client-go
 	./staging/src/k8s.io/cloud-provider

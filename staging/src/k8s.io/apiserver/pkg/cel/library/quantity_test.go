@@ -31,18 +31,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apiservercel "k8s.io/apiserver/pkg/cel"
-	"k8s.io/apiserver/pkg/cel/library"
 )
 
 func testQuantity(t *testing.T, expr string, expectResult ref.Val, expectRuntimeErrPattern string, expectCompileErrs []string) {
 	env, err := cel.NewEnv(
 		cel.OptionalTypes(),
 		ext.Strings(),
-		library.URLs(),
-		library.Regex(),
-		library.Lists(),
-		library.Quantity(),
-		library.Format(),
+		URLs(),
+		Regex(),
+		Lists(),
+		Quantity(),
+		Format(),
 	)
 	if err != nil {
 		t.Fatalf("%v", err)
