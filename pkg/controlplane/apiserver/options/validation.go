@@ -24,6 +24,7 @@ import (
 
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	genericfeatures "k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 	"k8s.io/kubernetes/pkg/features"
@@ -117,12 +118,79 @@ func validateServiceAccountTokenSigningConfig(options *Options) []error {
 	return errors
 }
 
+func selectedStorageBackend(o *Options) string {
+	b := strings.TrimSpace(o.Etcd.StorageConfig.Type)
+
+	switch b {
+	case "", "etcd", storagebackend.StorageTypeETCD3:
+		return "etcd"
+	case storagebackend.StorageTypeDynamo:
+		return "dynamo"
+	default:
+		return b
+	}
+}
+
+func validateCustomStorageFlags(o *Options) []error {
+	var errs []error
+
+	backend := selectedStorageBackend(o)
+
+	//hasEtcdServers := len(o.Etcd.StorageConfig.Transport.ServerList) > 0
+	//hasEtcdOverrides := len(o.Etcd.EtcdServersOverrides) > 0
+	hasDynamoRegion := strings.TrimSpace(o.CustomStorage.DynamoRegion) != ""
+	hasDynamoTable := strings.TrimSpace(o.CustomStorage.DynamoTable) != ""
+	hasDynamoEndpoint := strings.TrimSpace(o.CustomStorage.DynamoEndpoint) != ""
+	hasAnyDynamoFlag := hasDynamoRegion || hasDynamoTable || hasDynamoEndpoint
+
+	switch backend {
+	case "etcd":
+		if hasAnyDynamoFlag {
+			errs = append(errs, fmt.Errorf(
+				"--storage-backend=etcd3 is mutually exclusive with --dynamo-region, --dynamo-table, and --dynamo-endpoint",
+			))
+		}
+	case "dynamo":
+		//if hasEtcdServers {
+		//	errs = append(errs, fmt.Errorf(
+		//		"--storage-backend=dynamo is mutually exclusive with --etcd-servers",
+		//	))
+		//}
+		//if hasEtcdOverrides {
+		//	errs = append(errs, fmt.Errorf(
+		//		"--storage-backend=dynamo is mutually exclusive with --etcd-servers-overrides",
+		//	))
+		//}
+		if !hasDynamoRegion {
+			errs = append(errs, fmt.Errorf(
+				"--dynamo-region must be specified when --storage-backend=dynamo",
+			))
+		}
+		if !hasDynamoTable {
+			errs = append(errs, fmt.Errorf(
+				"--dynamo-table must be specified when --storage-backend=dynamo",
+			))
+		}
+	default:
+		errs = append(errs, fmt.Errorf(
+			"unsupported --storage-backend %q, supported values are: etcd3, dynamo",
+			backend,
+		))
+	}
+
+	return errs
+}
+
 // Validate checks Options and return a slice of found errs.
 func (s *Options) Validate() []error {
 	var errs []error
 
 	errs = append(errs, s.GenericServerRunOptions.Validate()...)
-	errs = append(errs, s.Etcd.Validate()...)
+	backend := selectedStorageBackend(s)
+	errs = append(errs, validateCustomStorageFlags(s)...)
+	if backend == "etcd" {
+		errs = append(errs, s.Etcd.Validate()...)
+	}
 	errs = append(errs, validateAPIPriorityAndFairness(s)...)
 	errs = append(errs, s.SecureServing.Validate()...)
 	errs = append(errs, s.Authentication.Validate()...)

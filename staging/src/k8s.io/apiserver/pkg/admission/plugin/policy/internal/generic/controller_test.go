@@ -39,8 +39,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 
-	"k8s.io/apiserver/pkg/admission/plugin/policy/internal/generic"
-
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 )
@@ -103,7 +101,7 @@ func init() {
 
 func setupTest(ctx context.Context, customReconciler func(string, string, runtime.Object) error) (
 	tracker clienttesting.ObjectTracker,
-	controller generic.Controller[*unstructured.Unstructured],
+	controller Controller[*unstructured.Unstructured],
 	informer *testInformer,
 	waitForReconcile func(runtime.Object) error,
 	verifyNoMoreEvents func() bool,
@@ -148,10 +146,10 @@ func setupTest(ctx context.Context, customReconciler func(string, string, runtim
 		}
 	}
 
-	myController := generic.NewController(
-		generic.NewInformer[*unstructured.Unstructured](informer),
+	myController := NewController(
+		NewInformer[*unstructured.Unstructured](informer),
 		reconciler,
-		generic.ControllerOptions{},
+		ControllerOptions{},
 	)
 
 	verifyNoMoreEvents = func() bool {

@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -34,7 +33,7 @@ import (
 // TestWantsAuthorizer ensures that the authorizer is injected
 // when the WantsAuthorizer interface is implemented by a plugin.
 func TestWantsAuthorizer(t *testing.T) {
-	target := initializer.New(nil, nil, nil, &TestAuthorizer{}, nil, nil, nil)
+	target := New(nil, nil, nil, &TestAuthorizer{}, nil, nil, nil)
 	wantAuthorizerAdmission := &WantAuthorizerAdmission{}
 	target.Initialize(wantAuthorizerAdmission)
 	if wantAuthorizerAdmission.auth == nil {
@@ -46,7 +45,7 @@ func TestWantsAuthorizer(t *testing.T) {
 // when the WantsExternalKubeClientSet interface is implemented by a plugin.
 func TestWantsExternalKubeClientSet(t *testing.T) {
 	cs := &fake.Clientset{}
-	target := initializer.New(cs, nil, nil, &TestAuthorizer{}, nil, nil, nil)
+	target := New(cs, nil, nil, &TestAuthorizer{}, nil, nil, nil)
 	wantExternalKubeClientSet := &WantExternalKubeClientSet{}
 	target.Initialize(wantExternalKubeClientSet)
 	if wantExternalKubeClientSet.cs != cs {
@@ -59,7 +58,7 @@ func TestWantsExternalKubeClientSet(t *testing.T) {
 func TestWantsExternalKubeInformerFactory(t *testing.T) {
 	cs := &fake.Clientset{}
 	sf := informers.NewSharedInformerFactory(cs, time.Duration(1)*time.Second)
-	target := initializer.New(cs, nil, sf, &TestAuthorizer{}, nil, nil, nil)
+	target := New(cs, nil, sf, &TestAuthorizer{}, nil, nil, nil)
 	wantExternalKubeInformerFactory := &WantExternalKubeInformerFactory{}
 	target.Initialize(wantExternalKubeInformerFactory)
 	if wantExternalKubeInformerFactory.sf != sf {
@@ -71,7 +70,7 @@ func TestWantsExternalKubeInformerFactory(t *testing.T) {
 // when the WantsShutdownSignal interface is implemented by a plugin.
 func TestWantsShutdownNotification(t *testing.T) {
 	stopCh := make(chan struct{})
-	target := initializer.New(nil, nil, nil, &TestAuthorizer{}, nil, stopCh, nil)
+	target := New(nil, nil, nil, &TestAuthorizer{}, nil, stopCh, nil)
 	wantDrainedNotification := &WantDrainedNotification{}
 	target.Initialize(wantDrainedNotification)
 	if wantDrainedNotification.stopCh == nil {
@@ -94,7 +93,7 @@ func (self *WantExternalKubeInformerFactory) Handles(o admission.Operation) bool
 func (self *WantExternalKubeInformerFactory) ValidateInitialization() error      { return nil }
 
 var _ admission.Interface = &WantExternalKubeInformerFactory{}
-var _ initializer.WantsExternalKubeInformerFactory = &WantExternalKubeInformerFactory{}
+var _ WantsExternalKubeInformerFactory = &WantExternalKubeInformerFactory{}
 
 // WantExternalKubeClientSet is a test stub that fulfills the WantsExternalKubeClientSet interface
 type WantExternalKubeClientSet struct {
@@ -111,7 +110,7 @@ func (self *WantExternalKubeClientSet) Handles(o admission.Operation) bool { ret
 func (self *WantExternalKubeClientSet) ValidateInitialization() error      { return nil }
 
 var _ admission.Interface = &WantExternalKubeClientSet{}
-var _ initializer.WantsExternalKubeClientSet = &WantExternalKubeClientSet{}
+var _ WantsExternalKubeClientSet = &WantExternalKubeClientSet{}
 
 // WantAuthorizerAdmission is a test stub that fulfills the WantsAuthorizer interface.
 type WantAuthorizerAdmission struct {
@@ -126,7 +125,7 @@ func (self *WantAuthorizerAdmission) Handles(o admission.Operation) bool { retur
 func (self *WantAuthorizerAdmission) ValidateInitialization() error      { return nil }
 
 var _ admission.Interface = &WantAuthorizerAdmission{}
-var _ initializer.WantsAuthorizer = &WantAuthorizerAdmission{}
+var _ WantsAuthorizer = &WantAuthorizerAdmission{}
 
 // WantDrainedNotification is a test stub that filfills the WantsDrainedNotification interface.
 type WantDrainedNotification struct {
@@ -143,7 +142,7 @@ func (self *WantDrainedNotification) Handles(o admission.Operation) bool { retur
 func (self *WantDrainedNotification) ValidateInitialization() error      { return nil }
 
 var _ admission.Interface = &WantDrainedNotification{}
-var _ initializer.WantsDrainedNotification = &WantDrainedNotification{}
+var _ WantsDrainedNotification = &WantDrainedNotification{}
 
 // TestAuthorizer is a test stub that fulfills the WantsAuthorizer interface.
 type TestAuthorizer struct{}
@@ -153,7 +152,7 @@ func (t *TestAuthorizer) Authorize(ctx context.Context, a authorizer.Attributes)
 }
 
 func TestRESTMapperAdmissionPlugin(t *testing.T) {
-	initializer := initializer.New(nil, nil, nil, &TestAuthorizer{}, nil, nil, &doNothingRESTMapper{})
+	initializer := New(nil, nil, nil, &TestAuthorizer{}, nil, nil, &doNothingRESTMapper{})
 	wantsRESTMapperAdmission := &WantsRESTMapperAdmissionPlugin{}
 	initializer.Initialize(wantsRESTMapperAdmission)
 

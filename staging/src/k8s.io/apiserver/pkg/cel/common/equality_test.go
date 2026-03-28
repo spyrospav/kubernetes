@@ -24,7 +24,6 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/apiserver/pkg/cel/common"
 	"k8s.io/apiserver/pkg/cel/openapi"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
@@ -45,7 +44,7 @@ type TestCase struct {
 	ExpectEqual bool
 
 	// Schema to provide to the correlated object
-	Schema common.Schema
+	Schema Schema
 
 	// Array of field names and indexes to traverse to get to the value
 	KeyPath []interface{}
@@ -57,7 +56,7 @@ type TestCase struct {
 
 func (c TestCase) Run() error {
 	// Create the correlated object
-	correlatedObject := common.NewCorrelatedObject(c.RootObject, c.RootOldObject, c.Schema)
+	correlatedObject := NewCorrelatedObject(c.RootObject, c.RootOldObject, c.Schema)
 
 	// Traverse the correlated object
 	var err error

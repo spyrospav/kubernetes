@@ -21,9 +21,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic"
+	"k8s.io/apiserver/pkg/storage/storagebackend"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,6 +64,43 @@ import (
 	rbacrest "k8s.io/kubernetes/pkg/registry/rbac/rest"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 )
+
+type perResourceTableRESTOptionsGetter struct {
+	delegate  genericregistry.RESTOptionsGetter
+	baseTable string
+}
+
+func sanitize(s string) string {
+	// Dynamo table names allow a bunch, but keep it simple.
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, ".", "_")
+	return s
+}
+
+func tableName(base string, gr schema.GroupResource) string {
+	group := sanitize(gr.Group)
+	if group == "" {
+		group = "core"
+	}
+	res := sanitize(gr.Resource)
+	return fmt.Sprintf("%s-%s-%s", base, group, res)
+}
+
+func (g perResourceTableRESTOptionsGetter) GetRESTOptions(
+	gr schema.GroupResource,
+	obj runtime.Object,
+) (genericregistry.RESTOptions, error) {
+	opts, err := g.delegate.GetRESTOptions(gr, obj)
+	if err != nil {
+		return opts, err
+	}
+
+	if opts.StorageConfig.Type == storagebackend.StorageTypeDynamo {
+		opts.StorageConfig.Dynamo.TableName = tableName(g.baseTable, gr)
+	}
+
+	return opts, nil
+}
 
 // Config defines configuration for the master
 type Config struct {
@@ -201,6 +242,14 @@ func BuildGenericConfig(
 	storageFactory.StorageConfig.StorageObjectCountTracker = genericConfig.StorageObjectCountTracker
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
+	}
+
+	backend := strings.TrimSpace(s.Etcd.StorageConfig.Type)
+	if backend == storagebackend.StorageTypeDynamo {
+		genericConfig.RESTOptionsGetter = perResourceTableRESTOptionsGetter{
+			delegate:  genericConfig.RESTOptionsGetter,
+			baseTable: s.Etcd.StorageConfig.Dynamo.TableName,
+		}
 	}
 
 	ctx := wait.ContextForChannel(genericConfig.DrainedNotify())

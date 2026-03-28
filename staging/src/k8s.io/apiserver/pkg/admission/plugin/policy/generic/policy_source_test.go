@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/admission/plugin/policy/generic"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/matching"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/kubernetes"
@@ -36,22 +35,22 @@ import (
 
 type fakeDispatcher struct{}
 
-func (fd *fakeDispatcher) Dispatch(context.Context, admission.Attributes, admission.ObjectInterfaces, []generic.PolicyHook[*FakePolicy, *FakeBinding, generic.Evaluator]) error {
+func (fd *fakeDispatcher) Dispatch(context.Context, admission.Attributes, admission.ObjectInterfaces, []PolicyHook[*FakePolicy, *FakeBinding, Evaluator]) error {
 	return nil
 }
 func (fd *fakeDispatcher) Start(context.Context) error {
 	return nil
 }
 
-func makeTestDispatcher(authorizer.Authorizer, *matching.Matcher, kubernetes.Interface) generic.Dispatcher[generic.PolicyHook[*FakePolicy, *FakeBinding, generic.Evaluator]] {
+func makeTestDispatcher(authorizer.Authorizer, *matching.Matcher, kubernetes.Interface) Dispatcher[PolicyHook[*FakePolicy, *FakeBinding, Evaluator]] {
 	return &fakeDispatcher{}
 }
 
 func TestPolicySourceHasSyncedEmpty(t *testing.T) {
-	testContext, testCancel, err := generic.NewPolicyTestContext(
-		func(fp *FakePolicy) generic.PolicyAccessor { return fp },
-		func(fb *FakeBinding) generic.BindingAccessor { return fb },
-		func(fp *FakePolicy) generic.Evaluator { return nil },
+	testContext, testCancel, err := NewPolicyTestContext(
+		func(fp *FakePolicy) PolicyAccessor { return fp },
+		func(fb *FakeBinding) BindingAccessor { return fb },
+		func(fp *FakePolicy) Evaluator { return nil },
 		makeTestDispatcher,
 		nil,
 		nil,
@@ -80,10 +79,10 @@ func TestPolicySourceHasSyncedInitialList(t *testing.T) {
 		},
 	}
 
-	testContext, testCancel, err := generic.NewPolicyTestContext(
-		func(fp *FakePolicy) generic.PolicyAccessor { return fp },
-		func(fb *FakeBinding) generic.BindingAccessor { return fb },
-		func(fp *FakePolicy) generic.Evaluator { return nil },
+	testContext, testCancel, err := NewPolicyTestContext(
+		func(fp *FakePolicy) PolicyAccessor { return fp },
+		func(fb *FakeBinding) BindingAccessor { return fb },
+		func(fp *FakePolicy) Evaluator { return nil },
 		makeTestDispatcher,
 		initialObjects,
 		nil,
@@ -149,10 +148,10 @@ func TestPolicySourceBindsToPolicies(t *testing.T) {
 		},
 	}
 
-	testContext, testCancel, err := generic.NewPolicyTestContext(
-		func(fp *FakePolicy) generic.PolicyAccessor { return fp },
-		func(fb *FakeBinding) generic.BindingAccessor { return fb },
-		func(fp *FakePolicy) generic.Evaluator { return nil },
+	testContext, testCancel, err := NewPolicyTestContext(
+		func(fp *FakePolicy) PolicyAccessor { return fp },
+		func(fb *FakeBinding) BindingAccessor { return fb },
+		func(fp *FakePolicy) Evaluator { return nil },
 		makeTestDispatcher,
 		initialObjects,
 		nil,
@@ -193,7 +192,7 @@ type FakePolicy struct {
 	ParamKind *v1.ParamKind
 }
 
-var _ generic.PolicyAccessor = &FakePolicy{}
+var _ PolicyAccessor = &FakePolicy{}
 
 type FakeBinding struct {
 	metav1.TypeMeta
@@ -202,7 +201,7 @@ type FakeBinding struct {
 	PolicyName string
 }
 
-var _ generic.BindingAccessor = &FakeBinding{}
+var _ BindingAccessor = &FakeBinding{}
 
 func (fp *FakePolicy) GetName() string {
 	return fp.Name

@@ -28,7 +28,6 @@ import (
 	"k8s.io/apiserver/pkg/apis/example"
 	examplev1 "k8s.io/apiserver/pkg/apis/example/v1"
 	example2v1 "k8s.io/apiserver/pkg/apis/example2/v1"
-	"k8s.io/apiserver/pkg/storage"
 )
 
 var (
@@ -43,7 +42,7 @@ func init() {
 }
 
 func TestHighWaterMark(t *testing.T) {
-	var h storage.HighWaterMark
+	var h HighWaterMark
 
 	for i := int64(10); i < 20; i++ {
 		if !h.Update(i) {
@@ -105,7 +104,7 @@ func TestHasInitialEventsEndBookmarkAnnotation(t *testing.T) {
 
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
-			hasAnnotation, err := storage.HasInitialEventsEndBookmarkAnnotation(scenario.object)
+			hasAnnotation, err := HasInitialEventsEndBookmarkAnnotation(scenario.object)
 			require.NoError(t, err)
 			require.Equal(t, scenario.expectAnnotation, hasAnnotation)
 		})

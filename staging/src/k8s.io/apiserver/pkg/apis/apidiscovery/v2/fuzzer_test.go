@@ -22,7 +22,6 @@ import (
 
 	v2 "k8s.io/api/apidiscovery/v2"
 	v2beta1 "k8s.io/api/apidiscovery/v2beta1"
-	v2scheme "k8s.io/apiserver/pkg/apis/apidiscovery/v2"
 	v2beta1scheme "k8s.io/apiserver/pkg/apis/apidiscovery/v2beta1"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,9 +36,9 @@ func TestConversionRoundTrip(t *testing.T) {
 	scheme := runtime.NewScheme()
 	err := v2beta1scheme.AddToScheme(scheme)
 	require.NoError(t, err)
-	err = v2scheme.AddToScheme(scheme)
+	err = AddToScheme(scheme)
 	require.NoError(t, err)
-	err = v2scheme.RegisterConversions(scheme)
+	err = RegisterConversions(scheme)
 	require.NoError(t, err)
 
 	fuzzer := randfill.NewWithSeed(2374375)

@@ -24,8 +24,6 @@ import (
 
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
-
-	discoveryendpoint "k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
 )
 
 func formatExpectedMetrics(aggregationCount int) io.Reader {
@@ -45,7 +43,7 @@ aggregator_discovery_aggregation_count_total %d
 
 func TestBasicMetrics(t *testing.T) {
 	legacyregistry.Reset()
-	manager := discoveryendpoint.NewResourceManager("apis")
+	manager := NewResourceManager("apis")
 
 	apis := fuzzAPIGroups(1, 3, 10)
 	manager.SetGroups(apis.Items)
@@ -66,7 +64,7 @@ func TestBasicMetrics(t *testing.T) {
 
 func TestMetricsModified(t *testing.T) {
 	legacyregistry.Reset()
-	manager := discoveryendpoint.NewResourceManager("apis")
+	manager := NewResourceManager("apis")
 
 	apis := fuzzAPIGroups(1, 3, 10)
 	manager.SetGroups(apis.Items)

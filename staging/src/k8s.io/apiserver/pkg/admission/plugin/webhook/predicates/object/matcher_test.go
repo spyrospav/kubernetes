@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook"
-	"k8s.io/apiserver/pkg/admission/plugin/webhook/predicates/object"
 )
 
 func TestObjectSelector(t *testing.T) {
@@ -52,7 +51,7 @@ func TestObjectSelector(t *testing.T) {
 			},
 		},
 	}
-	matcher := &object.Matcher{}
+	matcher := &Matcher{}
 	allScopes := v1.AllScopes
 	testcases := []struct {
 		name string

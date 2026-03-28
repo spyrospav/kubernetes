@@ -32,7 +32,6 @@ import (
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/generic"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/matching"
-	"k8s.io/apiserver/pkg/admission/plugin/policy/mutating"
 	"k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/client-go/kubernetes"
@@ -42,16 +41,16 @@ import (
 
 func setupTest(
 	t *testing.T,
-	compiler func(*mutating.Policy) mutating.PolicyEvaluator,
-) *generic.PolicyTestContext[*mutating.Policy, *mutating.PolicyBinding, mutating.PolicyEvaluator] {
+	compiler func(*Policy) PolicyEvaluator,
+) *generic.PolicyTestContext[*Policy, *PolicyBinding, PolicyEvaluator] {
 
-	testContext, testCancel, err := generic.NewPolicyTestContext[*mutating.Policy, *mutating.PolicyBinding, mutating.PolicyEvaluator](
-		mutating.NewMutatingAdmissionPolicyAccessor,
-		mutating.NewMutatingAdmissionPolicyBindingAccessor,
+	testContext, testCancel, err := generic.NewPolicyTestContext[*Policy, *PolicyBinding, PolicyEvaluator](
+		NewMutatingAdmissionPolicyAccessor,
+		NewMutatingAdmissionPolicyBindingAccessor,
 		compiler,
-		func(a authorizer.Authorizer, m *matching.Matcher, i kubernetes.Interface) generic.Dispatcher[mutating.PolicyHook] {
+		func(a authorizer.Authorizer, m *matching.Matcher, i kubernetes.Interface) generic.Dispatcher[PolicyHook] {
 			// Use embedded schemas rather than discovery schemas
-			return mutating.NewDispatcher(a, m, patch.NewTypeConverterManager(nil, openapitest.NewEmbeddedFileClient()))
+			return NewDispatcher(a, m, patch.NewTypeConverterManager(nil, openapitest.NewEmbeddedFileClient()))
 		},
 		nil,
 		[]meta.RESTMapping{
@@ -80,13 +79,13 @@ func TestBasicPatch(t *testing.T) {
 	expectedAnnotations := map[string]string{"foo": "bar"}
 
 	// Treat all policies as setting foo annotation to bar
-	testContext := setupTest(t, func(p *mutating.Policy) mutating.PolicyEvaluator {
-		return mutating.PolicyEvaluator{Mutators: []patch.Patcher{annotationPatcher{expectedAnnotations}}}
+	testContext := setupTest(t, func(p *Policy) PolicyEvaluator {
+		return PolicyEvaluator{Mutators: []patch.Patcher{annotationPatcher{expectedAnnotations}}}
 	})
 
 	// Set up a policy and binding that match, no params
 	require.NoError(t, testContext.UpdateAndWait(
-		&mutating.Policy{
+		&Policy{
 			ObjectMeta: metav1.ObjectMeta{Name: "policy"},
 			Spec: v1alpha1.MutatingAdmissionPolicySpec{
 				MatchConstraints: &v1alpha1.MatchResources{
@@ -104,7 +103,7 @@ func TestBasicPatch(t *testing.T) {
 				},
 			},
 		},
-		&mutating.PolicyBinding{
+		&PolicyBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "binding"},
 			Spec: v1alpha1.MutatingAdmissionPolicyBindingSpec{
 				PolicyName: "policy",
@@ -135,15 +134,15 @@ func TestJSONPatch(t *testing.T) {
 		},
 	}
 
-	testContext := setupTest(t, func(p *mutating.Policy) mutating.PolicyEvaluator {
-		return mutating.PolicyEvaluator{
+	testContext := setupTest(t, func(p *Policy) PolicyEvaluator {
+		return PolicyEvaluator{
 			Mutators: []patch.Patcher{smdPatcher{patch: patchObj}},
 		}
 	})
 
 	// Set up a policy and binding that match, no params
 	require.NoError(t, testContext.UpdateAndWait(
-		&mutating.Policy{
+		&Policy{
 			ObjectMeta: metav1.ObjectMeta{Name: "policy"},
 			Spec: v1alpha1.MutatingAdmissionPolicySpec{
 				MatchConstraints: &v1alpha1.MatchResources{
@@ -161,7 +160,7 @@ func TestJSONPatch(t *testing.T) {
 				},
 			},
 		},
-		&mutating.PolicyBinding{
+		&PolicyBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "binding"},
 			Spec: v1alpha1.MutatingAdmissionPolicyBindingSpec{
 				PolicyName: "policy",
@@ -197,15 +196,15 @@ func TestSSAPatch(t *testing.T) {
 		},
 	}
 
-	testContext := setupTest(t, func(p *mutating.Policy) mutating.PolicyEvaluator {
-		return mutating.PolicyEvaluator{
+	testContext := setupTest(t, func(p *Policy) PolicyEvaluator {
+		return PolicyEvaluator{
 			Mutators: []patch.Patcher{smdPatcher{patch: patchObj}},
 		}
 	})
 
 	// Set up a policy and binding that match, no params
 	require.NoError(t, testContext.UpdateAndWait(
-		&mutating.Policy{
+		&Policy{
 			ObjectMeta: metav1.ObjectMeta{Name: "policy"},
 			Spec: v1alpha1.MutatingAdmissionPolicySpec{
 				MatchConstraints: &v1alpha1.MatchResources{
@@ -223,7 +222,7 @@ func TestSSAPatch(t *testing.T) {
 				},
 			},
 		},
-		&mutating.PolicyBinding{
+		&PolicyBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "binding"},
 			Spec: v1alpha1.MutatingAdmissionPolicyBindingSpec{
 				PolicyName: "policy",
@@ -264,15 +263,15 @@ func TestSSAMapList(t *testing.T) {
 		},
 	}
 
-	testContext := setupTest(t, func(p *mutating.Policy) mutating.PolicyEvaluator {
-		return mutating.PolicyEvaluator{
+	testContext := setupTest(t, func(p *Policy) PolicyEvaluator {
+		return PolicyEvaluator{
 			Mutators: []patch.Patcher{smdPatcher{patch: patchObj}},
 		}
 	})
 
 	// Set up a policy and binding that match, no params
 	require.NoError(t, testContext.UpdateAndWait(
-		&mutating.Policy{
+		&Policy{
 			ObjectMeta: metav1.ObjectMeta{Name: "policy"},
 			Spec: v1alpha1.MutatingAdmissionPolicySpec{
 				MatchConstraints: &v1alpha1.MatchResources{
@@ -290,7 +289,7 @@ func TestSSAMapList(t *testing.T) {
 				},
 			},
 		},
-		&mutating.PolicyBinding{
+		&PolicyBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "binding"},
 			Spec: v1alpha1.MutatingAdmissionPolicyBindingSpec{
 				PolicyName: "policy",

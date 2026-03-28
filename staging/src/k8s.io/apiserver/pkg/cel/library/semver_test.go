@@ -28,12 +28,11 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	apiservercel "k8s.io/apiserver/pkg/cel"
-	library "k8s.io/apiserver/pkg/cel/library"
 )
 
 func testSemver(t *testing.T, expr string, expectResult ref.Val, expectRuntimeErrPattern string, expectCompileErrs []string, version uint32) {
 	env, err := cel.NewEnv(
-		library.SemverLib(library.SemverVersion(version)),
+		SemverLib(SemverVersion(version)),
 	)
 	if err != nil {
 		t.Fatalf("%v", err)

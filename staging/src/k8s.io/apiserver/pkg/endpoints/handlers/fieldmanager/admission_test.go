@@ -26,13 +26,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/endpoints/handlers/fieldmanager"
 	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 func TestAdmission(t *testing.T) {
 	wrap := &mockAdmissionController{}
-	ac := fieldmanager.NewManagedFieldsValidatingAdmissionController(wrap)
+	ac := NewManagedFieldsValidatingAdmissionController(wrap)
 	now := metav1.Now()
 
 	validFieldsV1 := metav1.FieldsV1{}
