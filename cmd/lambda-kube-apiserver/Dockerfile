@@ -7,7 +7,7 @@ WORKDIR /workspace
 COPY go.mod go.sum go.work go.work.sum ./
 COPY vendor/ vendor/
 COPY staging/ staging/
-COPY _local/apiserver/ _local/apiserver/
+# COPY _local/apiserver/ _local/apiserver/
 
 # Copy the source needed for the build
 COPY cmd/lambda-kube-apiserver/ cmd/lambda-kube-apiserver/
@@ -26,6 +26,11 @@ RUN mkdir -p /etc/kubernetes/pki && \
     openssl genrsa -out /etc/kubernetes/pki/sa.key 2048 && \
     openssl rsa -in /etc/kubernetes/pki/sa.key -pubout -out /etc/kubernetes/pki/sa.pub
 
+# Create a static token auth file for local/serverless testing.
+# Format: token,username,uid,"group1,group2"
+RUN mkdir -p /etc/kubernetes/auth && \
+    printf "devtoken123,lambda-user,uid-lambda,\"system:masters\"\n" > /etc/kubernetes/auth/tokens.csv
+
 # Runtime stage: AWS Lambda provided.al2023 base image
 FROM public.ecr.aws/lambda/provided:al2023 AS runtime
 
@@ -36,5 +41,6 @@ ENV AWS_SDK_LOAD_CONFIG=1 \
 
 COPY --from=builder /lambda-kube-apiserver ${LAMBDA_RUNTIME_DIR}/bootstrap
 COPY --from=builder /etc/kubernetes/pki /etc/kubernetes/pki
+COPY --from=builder /etc/kubernetes/auth /etc/kubernetes/auth
 
 CMD ["lambda-kube-apiserver"]

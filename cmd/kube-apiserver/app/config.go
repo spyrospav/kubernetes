@@ -19,6 +19,7 @@ package app
 import (
 	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 
@@ -84,6 +85,8 @@ func NewConfig(opts options.CompletedOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	genericConfig.DisabledStartupComponents = sets.NewString(opts.DisableStartupComponents...)
+	genericConfig.DisabledPostStartHooks.Insert(opts.DisableStartupComponents...)
 
 	kubeAPIs, serviceResolver, pluginInitializer, err := CreateKubeAPIServerConfig(opts, genericConfig, versionedInformers, storageFactory)
 	if err != nil {

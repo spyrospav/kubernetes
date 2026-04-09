@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strings"
 
 	genericoptions "k8s.io/apiserver/pkg/server/options"
@@ -30,6 +31,8 @@ import (
 	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
 	"k8s.io/kubernetes/pkg/features"
 )
+
+var startupComponentIdentifierRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9-./]*$`)
 
 // TODO: Longer term we should read this from some config store, rather than a flag.
 // validateClusterIPFlags is expected to be called after Complete()
@@ -135,6 +138,16 @@ func (s CompletedOptions) Validate() []error {
 	errs = append(errs, validateClusterIPFlags(s.Extra)...)
 	errs = append(errs, validateServiceNodePort(s.Extra)...)
 	errs = append(errs, validatePublicIPServiceClusterIPRangeIPFamilies(s.Extra, *s.GenericServerRunOptions)...)
+
+	for _, component := range s.DisableStartupComponents {
+		if len(component) == 0 {
+			errs = append(errs, fmt.Errorf("--disable-startup-component may not contain empty values"))
+			continue
+		}
+		if !startupComponentIdentifierRegexp.MatchString(component) {
+			errs = append(errs, fmt.Errorf("--disable-startup-component contains invalid identifier %q", component))
+		}
+	}
 
 	if s.MasterCount <= 0 {
 		errs = append(errs, fmt.Errorf("--apiserver-count should be a positive number, but value '%d' provided", s.MasterCount))

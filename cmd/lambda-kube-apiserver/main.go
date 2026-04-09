@@ -16,6 +16,48 @@ import (
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 )
 
+var lambdaDefaultDisabledStartupComponents = []string{
+	// Generic startup/readiness wiring
+	"generic-apiserver-start-informers",
+	"informer-sync-readyz",
+
+	// Generic request management loops
+	"priority-and-fairness-config-consumer",
+	"priority-and-fairness-filter",
+	"max-in-flight-filter",
+	"storage-object-count-tracker-hook",
+	"priority-and-fairness-config-producer",
+	"start-apiserver-admission-initializer",
+	"start-service-ip-repair-controllers",
+	"scheduling/bootstrap-system-priority-classes",
+
+	// Controlplane/bootstrap hooks
+	"bootstrap-controller",
+	"start-kubernetes-service-cidr-controller",
+	"start-system-namespaces-controller",
+	"start-kube-apiserver-coordinated-leader-election-controller",
+	"start-cluster-authentication-info-controller",
+	"start-kube-apiserver-identity-lease-controller",
+	"start-kube-apiserver-identity-lease-garbage-collector",
+	"start-legacy-token-tracking-controller",
+	"storage-readiness",
+
+	// Aggregator/peer controllers
+	"start-kube-aggregator-informers",
+	"apiservice-status-local-available-controller",
+	"apiservice-status-remote-available-controller",
+	"apiservice-registration-controller",
+	"apiservice-discovery-controller",
+	"apiservice-openapi-controller",
+	"apiservice-openapiv3-controller",
+	"kube-apiserver-autoregistration",
+	"autoregister-completion",
+	"peer-endpoint-reconciler-controller",
+	"local-discovery-cache-sync",
+	"peer-discovery-cache-sync",
+	"mixed-version-proxy-handler",
+}
+
 func main() {
 
 	ctx := context.Background()
@@ -24,6 +66,10 @@ func main() {
 	// Hardcode key startup options for serverless mode.
 	s.Authorization.Modes = []string{"AlwaysAllow"}
 	s.Authentication.Anonymous.Allow = true
+	// Handler-only model does not run informer/bootstrap startup paths.
+	// Use an explicit minimal admission chain to avoid fail-closed plugins that
+	// wait on informer sync and return "not yet ready to handle request".
+	s.Admission.PluginNames = []string{"AlwaysAdmit"}
 
 	dynamoRegion := getenvDefault("DYNAMO_REGION", "us-east-1")
 	dynamoTable := getenvDefault("DYNAMO_TABLE", "dynamo")
@@ -67,6 +113,9 @@ func main() {
 	completedOptions.CustomStorage.DynamoRegion = dynamoRegion
 	completedOptions.CustomStorage.DynamoTable = dynamoTable
 	completedOptions.CustomStorage.DynamoEndpoint = dynamoEndpoint
+	// model-1 (handler-only Lambda): do not rely on in-process startup controllers.
+	completedOptions.DisableStartupComponents = append([]string{}, lambdaDefaultDisabledStartupComponents...)
+	klog.InfoS("Configured disabled startup components", "count", len(completedOptions.DisableStartupComponents), "components", completedOptions.DisableStartupComponents)
 
 	if errs := completedOptions.Validate(); len(errs) != 0 {
 		log.Fatalf("invalid default options: %v", utilerrors.NewAggregate(errs))
@@ -107,7 +156,8 @@ func buildHandler(ctx context.Context, opts options.CompletedOptions) (http.Hand
 		return nil, err
 	}
 
-	prepared.APIAggregator.GenericAPIServer.RunPostStartHooks(ctx)
+	// model-1: do not start post-start hooks. They assume a running secure listener
+	// and make loopback client calls to :6443, which does not exist in handler-only mode.
 
 	handler := prepared.APIAggregator.GenericAPIServer.Handler
 	return handler, nil

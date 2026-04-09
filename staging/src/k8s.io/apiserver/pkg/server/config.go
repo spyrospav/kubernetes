@@ -148,6 +148,9 @@ type Config struct {
 	EnableMetrics             bool
 
 	DisabledPostStartHooks sets.String
+	// DisabledStartupComponents contains startup wiring component identifiers
+	// that should be disabled by the embedding binary.
+	DisabledStartupComponents sets.String
 	// done values in this values for this map are ignored.
 	PostStartHooks map[string]PostStartHookConfigEntry
 
@@ -430,6 +433,7 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		WatchRequestWaitGroup:          &utilwaitgroup.RateLimitedSafeWaitGroup{},
 		LegacyAPIGroupPrefixes:         sets.NewString(DefaultLegacyAPIPrefix),
 		DisabledPostStartHooks:         sets.NewString(),
+		DisabledStartupComponents:      sets.NewString(),
 		PostStartHooks:                 map[string]PostStartHookConfigEntry{},
 		HealthzChecks:                  append([]healthz.HealthChecker{}, defaultHealthChecks...),
 		ReadyzChecks:                   append([]healthz.HealthChecker{}, defaultHealthChecks...),
@@ -900,26 +904,31 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 	}
 
 	genericApiServerHookName := "generic-apiserver-start-informers"
+	const informerSyncReadyzName = "informer-sync-readyz"
 	if c.SharedInformerFactory != nil {
-		if !s.isPostStartHookRegistered(genericApiServerHookName) {
-			err := s.AddPostStartHook(genericApiServerHookName, func(hookContext PostStartHookContext) error {
-				c.SharedInformerFactory.Start(hookContext.Done())
-				return nil
-			})
+		if !c.DisabledStartupComponents.Has(genericApiServerHookName) && !c.DisabledPostStartHooks.Has(genericApiServerHookName) {
+			if !s.isPostStartHookRegistered(genericApiServerHookName) {
+				err := s.AddPostStartHook(genericApiServerHookName, func(hookContext PostStartHookContext) error {
+					c.SharedInformerFactory.Start(hookContext.Done())
+					return nil
+				})
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if !c.DisabledStartupComponents.Has(informerSyncReadyzName) {
+			// TODO: Once we get rid of /healthz consider changing this to post-start-hook.
+			err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
 			if err != nil {
 				return nil, err
 			}
-		}
-		// TODO: Once we get rid of /healthz consider changing this to post-start-hook.
-		err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
-		if err != nil {
-			return nil, err
 		}
 	}
 
 	const priorityAndFairnessConfigConsumerHookName = "priority-and-fairness-config-consumer"
 	if s.isPostStartHookRegistered(priorityAndFairnessConfigConsumerHookName) {
-	} else if c.FlowControl != nil {
+	} else if c.FlowControl != nil && !c.DisabledStartupComponents.Has(priorityAndFairnessConfigConsumerHookName) {
 		err := s.AddPostStartHook(priorityAndFairnessConfigConsumerHookName, func(hookContext PostStartHookContext) error {
 			go c.FlowControl.Run(hookContext.Done())
 			return nil
@@ -935,7 +944,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 	// Add PostStartHooks for maintaining the watermarks for the Priority-and-Fairness and the Max-in-Flight filters.
 	if c.FlowControl != nil {
 		const priorityAndFairnessFilterHookName = "priority-and-fairness-filter"
-		if !s.isPostStartHookRegistered(priorityAndFairnessFilterHookName) {
+		if !s.isPostStartHookRegistered(priorityAndFairnessFilterHookName) && !c.DisabledStartupComponents.Has(priorityAndFairnessFilterHookName) {
 			err := s.AddPostStartHook(priorityAndFairnessFilterHookName, func(hookContext PostStartHookContext) error {
 				genericfilters.StartPriorityAndFairnessWatermarkMaintenance(hookContext.Done())
 				return nil
@@ -946,7 +955,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		}
 	} else {
 		const maxInFlightFilterHookName = "max-in-flight-filter"
-		if !s.isPostStartHookRegistered(maxInFlightFilterHookName) {
+		if !s.isPostStartHookRegistered(maxInFlightFilterHookName) && !c.DisabledStartupComponents.Has(maxInFlightFilterHookName) {
 			err := s.AddPostStartHook(maxInFlightFilterHookName, func(hookContext PostStartHookContext) error {
 				genericfilters.StartMaxInFlightWatermarkMaintenance(hookContext.Done())
 				return nil
@@ -960,7 +969,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 	// Add PostStartHook for maintenaing the object count tracker.
 	if c.StorageObjectCountTracker != nil {
 		const storageObjectCountTrackerHookName = "storage-object-count-tracker-hook"
-		if !s.isPostStartHookRegistered(storageObjectCountTrackerHookName) {
+		if !s.isPostStartHookRegistered(storageObjectCountTrackerHookName) && !c.DisabledStartupComponents.Has(storageObjectCountTrackerHookName) {
 			if err := s.AddPostStartHook(storageObjectCountTrackerHookName, func(hookContext PostStartHookContext) error {
 				go c.StorageObjectCountTracker.RunUntil(hookContext.Done())
 				return nil

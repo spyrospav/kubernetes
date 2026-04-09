@@ -46,6 +46,9 @@ type Extra struct {
 	AllowPrivileged           bool
 	KubeletConfig             kubeletclient.KubeletClientConfig
 	KubernetesServiceNodePort int
+	// DisableStartupComponents holds startup component identifiers that should be disabled.
+	// The identifiers are interpreted by lower layers during startup wiring.
+	DisableStartupComponents []string
 	// ServiceClusterIPRange is mapped to input provided by user
 	ServiceClusterIPRanges string
 	// PrimaryServiceClusterIPRange and SecondaryServiceClusterIPRange are the results
@@ -116,6 +119,9 @@ func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 		"If non-zero, the Kubernetes master service (which apiserver creates/maintains) will be "+
 		"of type NodePort, using this as the value of the port. If zero, the Kubernetes master "+
 		"service will be of type ClusterIP.")
+
+	fs.StringSliceVar(&s.DisableStartupComponents, "disable-startup-component", s.DisableStartupComponents,
+		"Disable specific startup wiring components by identifier. Repeat this flag to disable multiple components.")
 
 	fs.StringVar(&s.ServiceClusterIPRanges, "service-cluster-ip-range", s.ServiceClusterIPRanges, ""+
 		"A CIDR notation IP range from which to assign service cluster IPs. This must not "+

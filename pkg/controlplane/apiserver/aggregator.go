@@ -180,15 +180,18 @@ func CreateAggregatorServer(aggregatorConfig aggregatorapiserver.CompletedConfig
 		return nil, err
 	}
 
-	err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
-		makeAPIServiceAvailableHealthCheck(
-			"autoregister-completion",
-			apiServices,
-			aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
-		),
-	)
-	if err != nil {
-		return nil, err
+	if !aggregatorConfig.GenericConfig.DisabledStartupComponents.Has("autoregister-completion") &&
+		!aggregatorConfig.GenericConfig.DisabledStartupComponents.Has("kube-apiserver-autoregistration") {
+		err = aggregatorServer.GenericAPIServer.AddBootSequenceHealthChecks(
+			makeAPIServiceAvailableHealthCheck(
+				"autoregister-completion",
+				apiServices,
+				aggregatorServer.APIRegistrationInformers.Apiregistration().V1().APIServices(),
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return aggregatorServer, nil
