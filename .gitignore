@@ -23,6 +23,8 @@ __*
 /output*/
 /_output*/
 /_output
+/vendor
+/LICENSES/vendor
 
 # Emacs save files
 *~

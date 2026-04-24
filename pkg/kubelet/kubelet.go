@@ -42,7 +42,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"k8s.io/client-go/informers"
 	"k8s.io/mount-utils"
 
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -52,8 +51,8 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -62,8 +61,6 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/certificate"
 	"k8s.io/client-go/util/flowcontrol"
@@ -463,25 +460,21 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		return nil, fmt.Errorf("cloud provider %q was specified, but built-in cloud providers are disabled. Please set --cloud-provider=external and migrate to an external cloud provider", cloudProvider)
 	}
 
-	var nodeHasSynced cache.InformerSynced
-	var nodeLister corelisters.NodeLister
+	var nodeHasSynced func() bool
+	var nodeLister nodeLister
 
 	// If kubeClient == nil, we are running in standalone mode (i.e. no API servers)
 	// If not nil, we are running as part of a cluster and should sync w/API
 	if kubeDeps.KubeClient != nil {
-		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.FieldSelector = fields.Set{metav1.ObjectNameField: string(nodeName)}.String()
-		}))
-		nodeLister = kubeInformers.Core().V1().Nodes().Lister()
+		nodeLister = apiNodeLister{client: kubeDeps.KubeClient}
 		nodeHasSynced = func() bool {
-			return kubeInformers.Core().V1().Nodes().Informer().HasSynced()
+			_, err := nodeLister.Get(string(nodeName))
+			return err == nil
 		}
-		kubeInformers.Start(wait.NeverStop)
-		klog.InfoS("Attempting to sync node with API server")
+		klog.InfoS("Using direct apiserver node lister for serverless no-watch mode")
 	} else {
 		// we don't have a client to sync!
-		nodeIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-		nodeLister = corelisters.NewNodeLister(nodeIndexer)
+		nodeLister = emptyNodeLister{}
 		nodeHasSynced = func() bool { return true }
 		klog.InfoS("Kubelet is running in standalone mode, will skip API server sync")
 	}
@@ -533,20 +526,14 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		PodCgroupRoot:            kubeDeps.ContainerManager.GetPodCgroupRoot(),
 	}
 
-	var serviceLister corelisters.ServiceLister
-	var serviceHasSynced cache.InformerSynced
+	var serviceLister serviceLister
+	var serviceHasSynced func() bool
 	if kubeDeps.KubeClient != nil {
-		// don't watch headless services, they are not needed since this informer is only used to create the environment variables for pods.
-		// See https://issues.k8s.io/122394
-		kubeInformers := informers.NewSharedInformerFactoryWithOptions(kubeDeps.KubeClient, 0, informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.FieldSelector = fields.OneTermNotEqualSelector("spec.clusterIP", v1.ClusterIPNone).String()
-		}))
-		serviceLister = kubeInformers.Core().V1().Services().Lister()
-		serviceHasSynced = kubeInformers.Core().V1().Services().Informer().HasSynced
-		kubeInformers.Start(wait.NeverStop)
+		serviceLister = apiServiceLister{client: kubeDeps.KubeClient}
+		serviceHasSynced = func() bool { return true }
+		klog.InfoS("Using direct apiserver service lister for serverless no-watch mode")
 	} else {
-		serviceIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-		serviceLister = corelisters.NewServiceLister(serviceIndexer)
+		serviceLister = emptyServiceLister{}
 		serviceHasSynced = func() bool { return true }
 	}
 
@@ -660,8 +647,9 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 	if klet.kubeClient != nil {
 		switch kubeCfg.ConfigMapAndSecretChangeDetectionStrategy {
 		case kubeletconfiginternal.WatchChangeDetectionStrategy:
-			secretManager = secret.NewWatchingSecretManager(klet.kubeClient, klet.resyncInterval)
-			configMapManager = configmap.NewWatchingConfigMapManager(klet.kubeClient, klet.resyncInterval)
+			klog.InfoS("Using direct GET configmap/secret managers for serverless no-watch mode")
+			secretManager = secret.NewSimpleSecretManager(klet.kubeClient)
+			configMapManager = configmap.NewSimpleConfigMapManager(klet.kubeClient)
 		case kubeletconfiginternal.TTLCacheChangeDetectionStrategy:
 			secretManager = secret.NewCachingSecretManager(
 				klet.kubeClient, manager.GetObjectTTLFromNodeFunc(klet.GetNode))
@@ -704,9 +692,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 
 	klet.runtimeService = kubeDeps.RemoteRuntimeService
 
-	if kubeDeps.KubeClient != nil {
-		klet.runtimeClassManager = runtimeclass.NewManager(kubeDeps.KubeClient)
-	}
+	klog.InfoS("RuntimeClass informer disabled for serverless no-watch mode")
 
 	// setup containerLogManager for CRI container runtime
 	containerLogManager, err := logs.NewContainerLogManager(
@@ -1076,6 +1062,71 @@ type serviceLister interface {
 	List(labels.Selector) ([]*v1.Service, error)
 }
 
+type nodeLister interface {
+	List(labels.Selector) ([]*v1.Node, error)
+	Get(name string) (*v1.Node, error)
+}
+
+type apiNodeLister struct {
+	client clientset.Interface
+}
+
+func (l apiNodeLister) Get(name string) (*v1.Node, error) {
+	return l.client.CoreV1().Nodes().Get(context.TODO(), name, metav1.GetOptions{})
+}
+
+func (l apiNodeLister) List(selector labels.Selector) ([]*v1.Node, error) {
+	opts := metav1.ListOptions{ResourceVersion: "0"}
+	if selector != nil {
+		opts.LabelSelector = selector.String()
+	}
+	nodeList, err := l.client.CoreV1().Nodes().List(context.TODO(), opts)
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]*v1.Node, 0, len(nodeList.Items))
+	for i := range nodeList.Items {
+		nodes = append(nodes, nodeList.Items[i].DeepCopy())
+	}
+	return nodes, nil
+}
+
+type emptyNodeLister struct{}
+
+func (emptyNodeLister) Get(name string) (*v1.Node, error) {
+	return nil, apierrors.NewNotFound(v1.Resource("nodes"), name)
+}
+
+func (emptyNodeLister) List(labels.Selector) ([]*v1.Node, error) {
+	return nil, nil
+}
+
+type apiServiceLister struct {
+	client clientset.Interface
+}
+
+func (l apiServiceLister) List(selector labels.Selector) ([]*v1.Service, error) {
+	opts := metav1.ListOptions{ResourceVersion: "0"}
+	if selector != nil {
+		opts.LabelSelector = selector.String()
+	}
+	serviceList, err := l.client.CoreV1().Services(metav1.NamespaceAll).List(context.TODO(), opts)
+	if err != nil {
+		return nil, err
+	}
+	services := make([]*v1.Service, 0, len(serviceList.Items))
+	for i := range serviceList.Items {
+		services = append(services, serviceList.Items[i].DeepCopy())
+	}
+	return services, nil
+}
+
+type emptyServiceLister struct{}
+
+func (emptyServiceLister) List(labels.Selector) ([]*v1.Service, error) {
+	return nil, nil
+}
+
 // Kubelet is the main kubelet implementation.
 type Kubelet struct {
 	kubeletConfiguration kubeletconfiginternal.KubeletConfiguration
@@ -1220,12 +1271,12 @@ type Kubelet struct {
 	serviceLister serviceLister
 	// serviceHasSynced indicates whether services have been sync'd at least once.
 	// Check this before trusting a response from the lister.
-	serviceHasSynced cache.InformerSynced
+	serviceHasSynced func() bool
 	// nodeLister knows how to list nodes
-	nodeLister corelisters.NodeLister
+	nodeLister nodeLister
 	// nodeHasSynced indicates whether nodes have been sync'd at least once.
 	// Check this before trusting a response from the node lister.
-	nodeHasSynced cache.InformerSynced
+	nodeHasSynced func() bool
 	// a list of node labels to register
 	nodeLabels map[string]string
 

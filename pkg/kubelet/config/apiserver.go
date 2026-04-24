@@ -17,6 +17,7 @@ limitations under the License.
 package config
 
 import (
+	"context"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -25,21 +26,23 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
-// WaitForAPIServerSyncPeriod is the period between checks for the node list/watch initial sync
+// WaitForAPIServerSyncPeriod is the period between checks for the node API sync.
 const WaitForAPIServerSyncPeriod = 1 * time.Second
 
-// NewSourceApiserver creates a config source that watches and pulls from the apiserver.
-func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, nodeHasSynced func() bool, updates chan<- interface{}) {
-	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector("spec.nodeName", string(nodeName)))
+// APIServerPollPeriod is how often the serverless kubelet refreshes pods assigned
+// to this node. The Lambda apiserver intentionally does not support watch, so the
+// kubelet uses whole-list snapshots instead.
+const APIServerPollPeriod = 5 * time.Second
 
-	// The Reflector responsible for watching pods at the apiserver should be run only after
-	// the node sync with the apiserver has completed.
-	klog.InfoS("Waiting for node sync before watching apiserver pods")
+// NewSourceApiserver creates a config source that polls pods assigned to this
+// node from the apiserver. This custom kubelet path is intentionally watch-free
+// for serverless apiserver compatibility.
+func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, nodeHasSynced func() bool, updates chan<- interface{}) {
+	klog.InfoS("Waiting for node sync before polling apiserver pods")
 	go func() {
 		for {
 			if nodeHasSynced() {
@@ -49,20 +52,40 @@ func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, nodeHasS
 			time.Sleep(WaitForAPIServerSyncPeriod)
 			klog.V(4).InfoS("node sync has not completed yet")
 		}
-		klog.InfoS("Watching apiserver")
-		newSourceApiserverFromLW(lw, updates)
+		klog.InfoS("Polling apiserver for assigned pods", "period", APIServerPollPeriod)
+		pollApiserverPods(context.Background(), c, nodeName, updates, APIServerPollPeriod)
 	}()
 }
 
-// newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
-func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}) {
-	send := func(objs []interface{}) {
-		var pods []*v1.Pod
-		for _, o := range objs {
-			pods = append(pods, o.(*v1.Pod))
+func pollApiserverPods(ctx context.Context, c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}, period time.Duration) {
+	wait.UntilWithContext(ctx, func(ctx context.Context) {
+		if err := pollApiserverPodsOnce(ctx, c, nodeName, updates); err != nil {
+			klog.ErrorS(err, "Failed polling apiserver pods", "node", nodeName)
 		}
-		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+	}, period)
+}
+
+func pollApiserverPodsOnce(ctx context.Context, c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}) error {
+	pods, err := listAssignedPods(ctx, c, nodeName)
+	if err != nil {
+		return err
 	}
-	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
-	go r.Run(wait.NeverStop)
+	updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+	return nil
+}
+
+func listAssignedPods(ctx context.Context, c clientset.Interface, nodeName types.NodeName) ([]*v1.Pod, error) {
+	podList, err := c.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector:   fields.OneTermEqualSelector("spec.nodeName", string(nodeName)).String(),
+		ResourceVersion: "0",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	pods := make([]*v1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pods = append(pods, podList.Items[i].DeepCopy())
+	}
+	return pods, nil
 }

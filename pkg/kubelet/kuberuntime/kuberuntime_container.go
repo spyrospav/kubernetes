@@ -178,6 +178,9 @@ func (m *kubeGenericRuntimeManager) getPodRuntimeHandler(pod *v1.Pod) (podRuntim
 	// specified, then pass ""
 	if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
 		if pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName != "" {
+			if m.runtimeClassManager == nil {
+				return "", fmt.Errorf("runtimeClassName %q is not supported in serverless no-watch mode", *pod.Spec.RuntimeClassName)
+			}
 			podRuntimeHandler, err = m.runtimeClassManager.LookupRuntimeHandler(pod.Spec.RuntimeClassName)
 			if err != nil {
 				msg := fmt.Sprintf("Failed to lookup runtimeHandler for runtimeClassName %v", pod.Spec.RuntimeClassName)

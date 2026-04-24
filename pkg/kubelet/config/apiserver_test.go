@@ -17,178 +17,98 @@ limitations under the License.
 package config
 
 import (
+	"context"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	core "k8s.io/client-go/testing"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
-type fakePodLW struct {
-	listResp  runtime.Object
-	watchResp watch.Interface
-}
-
-func (lw fakePodLW) List(options metav1.ListOptions) (runtime.Object, error) {
-	return lw.listResp, nil
-}
-
-func (lw fakePodLW) Watch(options metav1.ListOptions) (watch.Interface, error) {
-	return lw.watchResp, nil
-}
-
-var _ cache.ListerWatcher = fakePodLW{}
-
-func TestNewSourceApiserver_UpdatesAndMultiplePods(t *testing.T) {
-	pod1v1 := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "p"},
-		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/one"}}}}
-	pod1v2 := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "p"},
-		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/two"}}}}
-	pod2 := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "q"},
-		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/blah"}}}}
-
-	// Setup fake api client.
-	fakeWatch := watch.NewFake()
-	lw := fakePodLW{
-		listResp:  &v1.PodList{Items: []v1.Pod{*pod1v1}},
-		watchResp: fakeWatch,
-	}
-
-	ch := make(chan interface{})
-
-	newSourceApiserverFromLW(lw, ch)
-
-	got, ok := <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update := got.(kubetypes.PodUpdate)
-	expected := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v1)
-	if !apiequality.Semantic.DeepEqual(expected, update) {
-		t.Errorf("Expected %#v; Got %#v", expected, update)
-	}
-
-	// Add another pod
-	fakeWatch.Add(pod2)
-	got, ok = <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update = got.(kubetypes.PodUpdate)
-	// Could be sorted either of these two ways:
-	expectedA := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v1, pod2)
-	expectedB := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2, pod1v1)
-
-	if !apiequality.Semantic.DeepEqual(expectedA, update) && !apiequality.Semantic.DeepEqual(expectedB, update) {
-		t.Errorf("Expected %#v or %#v, Got %#v", expectedA, expectedB, update)
-	}
-
-	// Modify pod1
-	fakeWatch.Modify(pod1v2)
-	got, ok = <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update = got.(kubetypes.PodUpdate)
-	expectedA = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod1v2, pod2)
-	expectedB = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2, pod1v2)
-
-	if !apiequality.Semantic.DeepEqual(expectedA, update) && !apiequality.Semantic.DeepEqual(expectedB, update) {
-		t.Errorf("Expected %#v or %#v, Got %#v", expectedA, expectedB, update)
-	}
-
-	// Delete pod1
-	fakeWatch.Delete(pod1v2)
-	got, ok = <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update = got.(kubetypes.PodUpdate)
-	expected = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource, pod2)
-	if !apiequality.Semantic.DeepEqual(expected, update) {
-		t.Errorf("Expected %#v, Got %#v", expected, update)
-	}
-
-	// Delete pod2
-	fakeWatch.Delete(pod2)
-	got, ok = <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update = got.(kubetypes.PodUpdate)
-	expected = CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource)
-	if !apiequality.Semantic.DeepEqual(expected, update) {
-		t.Errorf("Expected %#v, Got %#v", expected, update)
-	}
-}
-
-func TestNewSourceApiserver_TwoNamespacesSameName(t *testing.T) {
-	pod1 := v1.Pod{
+func TestPollApiserverPodsOnceSendsAssignedPods(t *testing.T) {
+	pod1 := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "one"},
-		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/one"}}}}
-	pod2 := v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "two"},
-		Spec:       v1.PodSpec{Containers: []v1.Container{{Image: "image/blah"}}}}
-
-	// Setup fake api client.
-	fakeWatch := watch.NewFake()
-	lw := fakePodLW{
-		listResp:  &v1.PodList{Items: []v1.Pod{pod1, pod2}},
-		watchResp: fakeWatch,
+		Spec: v1.PodSpec{
+			NodeName:   "node-a",
+			Containers: []v1.Container{{Image: "image/one"}},
+		},
+	}
+	pod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "q", Namespace: "two"},
+		Spec: v1.PodSpec{
+			NodeName:   "node-a",
+			Containers: []v1.Container{{Image: "image/two"}},
+		},
+	}
+	otherNodePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "three"},
+		Spec: v1.PodSpec{
+			NodeName:   "node-b",
+			Containers: []v1.Container{{Image: "image/three"}},
+		},
 	}
 
-	ch := make(chan interface{})
+	client := fake.NewSimpleClientset(otherNodePod)
+	client.PrependReactor("list", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		listAction := action.(core.ListAction)
+		if got, want := listAction.GetListRestrictions().Fields.String(), "spec.nodeName=node-a"; got != want {
+			t.Fatalf("expected field selector %q, got %q", want, got)
+		}
+		return true, &v1.PodList{Items: []v1.Pod{*pod1, *pod2}}, nil
+	})
+	ch := make(chan interface{}, 1)
 
-	newSourceApiserverFromLW(lw, ch)
-
-	got, ok := <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
-	}
-	update := got.(kubetypes.PodUpdate)
-	// Make sure that we get both pods.  Catches bug #2294.
-	if !(len(update.Pods) == 2) {
-		t.Errorf("Expected %d, Got %d", 2, len(update.Pods))
+	if err := pollApiserverPodsOnce(context.Background(), client, types.NodeName("node-a"), ch); err != nil {
+		t.Fatalf("pollApiserverPodsOnce returned error: %v", err)
 	}
 
-	// Delete pod1
-	fakeWatch.Delete(&pod1)
-	got, ok = <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
+	got := (<-ch).(kubetypes.PodUpdate)
+	expected := kubetypes.PodUpdate{
+		Pods:   []*v1.Pod{pod1, pod2},
+		Op:     kubetypes.SET,
+		Source: kubetypes.ApiserverSource,
 	}
-	update = got.(kubetypes.PodUpdate)
-	if !(len(update.Pods) == 1) {
-		t.Errorf("Expected %d, Got %d", 1, len(update.Pods))
+	if !apiequality.Semantic.DeepEqual(expected, got) {
+		t.Fatalf("expected %#v, got %#v", expected, got)
 	}
 }
 
-func TestNewSourceApiserverInitialEmptySendsEmptyPodUpdate(t *testing.T) {
-	// Setup fake api client.
-	fakeWatch := watch.NewFake()
-	lw := fakePodLW{
-		listResp:  &v1.PodList{Items: []v1.Pod{}},
-		watchResp: fakeWatch,
+func TestPollApiserverPodsOnceInitialEmptySendsEmptyPodUpdate(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	ch := make(chan interface{}, 1)
+
+	if err := pollApiserverPodsOnce(context.Background(), client, types.NodeName("node-a"), ch); err != nil {
+		t.Fatalf("pollApiserverPodsOnce returned error: %v", err)
 	}
 
-	ch := make(chan interface{})
-
-	newSourceApiserverFromLW(lw, ch)
-
-	got, ok := <-ch
-	if !ok {
-		t.Errorf("Unable to read from channel when expected")
+	got := (<-ch).(kubetypes.PodUpdate)
+	expected := kubetypes.PodUpdate{
+		Pods:   []*v1.Pod{},
+		Op:     kubetypes.SET,
+		Source: kubetypes.ApiserverSource,
 	}
-	update := got.(kubetypes.PodUpdate)
-	expected := CreatePodUpdate(kubetypes.SET, kubetypes.ApiserverSource)
-	if !apiequality.Semantic.DeepEqual(expected, update) {
-		t.Errorf("Expected %#v; Got %#v", expected, update)
+	if !apiequality.Semantic.DeepEqual(expected, got) {
+		t.Fatalf("expected %#v, got %#v", expected, got)
+	}
+}
+
+func TestPollApiserverPodsOnceReturnsListError(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("list", "pods", func(action core.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("apiserver unavailable")
+	})
+	ch := make(chan interface{}, 1)
+
+	if err := pollApiserverPodsOnce(context.Background(), client, types.NodeName("node-a"), ch); err == nil {
+		t.Fatalf("expected list error, got nil")
+	}
+	if len(ch) != 0 {
+		t.Fatalf("expected no update on list error")
 	}
 }
