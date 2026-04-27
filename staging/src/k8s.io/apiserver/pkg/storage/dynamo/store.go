@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"path"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -205,6 +207,27 @@ func (s *store) getCurrentObjectState(ctx context.Context, preparedKey string, v
 }
 
 // getCurrentRV reads the meta row and returns current_rv.
+// sleepMetaBackoff blocks for an exponentially-growing, jittered duration
+// before retrying the meta-row CAS. Without this, all writers contending on
+// the global resource-version meta row re-read curRV in lockstep and
+// re-collide, exhausting the per-call retry budget under modest concurrency.
+// Cap is intentionally small so the latency impact on uncontended writes
+// remains negligible while heavily-contended writes get spread out.
+func sleepMetaBackoff(ctx context.Context, attempt int) {
+	const capDelay = 50 * time.Millisecond
+	delay := time.Millisecond << uint(attempt) // 1ms, 2ms, 4ms, ...
+	if delay <= 0 || delay > capDelay {
+		delay = capDelay
+	}
+	delay += time.Duration(rand.Int63n(int64(delay) + 1))
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
 func (s *store) getCurrentRV(ctx context.Context) (uint64, error) {
 	resp, err := s.ddb.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(s.tableName),
@@ -722,7 +745,7 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		return storage.NewInternalError(err)
 	}
 
-	const maxAttempts = 10
+	const maxAttempts = 50
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curRV, err := s.getCurrentRV(ctx)
 		if err != nil {
@@ -784,7 +807,8 @@ func (s *store) Create(ctx context.Context, key string, obj, out runtime.Object,
 		if isKeyExistsTxnError(err) {
 			return storage.NewKeyExistsError(preparedKey, 0)
 		}
-		if isMetaConflictTxnError(err) {
+		if isMetaConflictTxnError(err) || isTxnConflictError(err) {
+			sleepMetaBackoff(ctx, attempt)
 			continue
 		}
 		return storage.NewInternalError(fmt.Errorf("TransactWriteItems(Create): %w", err))
@@ -819,7 +843,7 @@ func (s *store) Delete(
 		validateDeletion = func(context.Context, runtime.Object) error { return nil }
 	}
 
-	const maxTxnAttempts = 10
+	const maxTxnAttempts = 50
 
 	for {
 		// Always read the current object state.
@@ -904,7 +928,8 @@ func (s *store) Delete(
 			}
 
 			// Meta row moved; retry inner loop (re-read curRV next iteration).
-			if isMetaConflictTxnError(err) {
+			if isMetaConflictTxnError(err) || isTxnConflictError(err) {
+				sleepMetaBackoff(ctx, attempt)
 				continue
 			}
 
@@ -982,7 +1007,7 @@ func (s *store) GuaranteedUpdate(
 
 	transformContext := authenticatedDataString(preparedKey)
 
-	const maxMetaAttempts = 10
+	const maxMetaAttempts = 50
 
 	for {
 		origState, err := getCurrentState()
@@ -1104,7 +1129,8 @@ func (s *store) GuaranteedUpdate(
 				return nil
 			}
 
-			if isMetaConflictTxnError(err) {
+			if isMetaConflictTxnError(err) || isTxnConflictError(err) {
+				sleepMetaBackoff(ctx, attempt)
 				continue
 			}
 			if txnCanceledConditionalFailed(err, 1) {

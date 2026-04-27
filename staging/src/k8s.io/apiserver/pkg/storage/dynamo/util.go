@@ -74,15 +74,35 @@ func parseStringAttr(item map[string]ddbtypes.AttributeValue, attr string) (stri
 }
 
 func txnCanceledConditionalFailed(err error, idx int) bool {
+	return txnCanceledReasonCode(err, idx) == "ConditionalCheckFailed"
+}
+
+func txnCanceledReasonCode(err error, idx int) string {
+	var tce *ddbtypes.TransactionCanceledException
+	if !errors.As(err, &tce) {
+		return ""
+	}
+	if idx < 0 || idx >= len(tce.CancellationReasons) {
+		return ""
+	}
+	return aws.ToString(tce.CancellationReasons[idx].Code)
+}
+
+func txnCanceledHasReason(err error, code string) bool {
 	var tce *ddbtypes.TransactionCanceledException
 	if !errors.As(err, &tce) {
 		return false
 	}
-	if idx < 0 || idx >= len(tce.CancellationReasons) {
-		return false
+	for i := range tce.CancellationReasons {
+		if aws.ToString(tce.CancellationReasons[i].Code) == code {
+			return true
+		}
 	}
-	code := aws.ToString(tce.CancellationReasons[idx].Code)
-	return code == "ConditionalCheckFailed"
+	return false
+}
+
+func isTxnConflictError(err error) bool {
+	return txnCanceledHasReason(err, "TransactionConflict")
 }
 
 func isKeyExistsTxnError(err error) bool {
