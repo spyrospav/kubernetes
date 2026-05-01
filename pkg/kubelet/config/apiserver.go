@@ -36,7 +36,7 @@ const WaitForAPIServerSyncPeriod = 1 * time.Second
 // APIServerPollPeriod is how often the serverless kubelet refreshes pods assigned
 // to this node. The Lambda apiserver intentionally does not support watch, so the
 // kubelet uses whole-list snapshots instead.
-const APIServerPollPeriod = 5 * time.Second
+const APIServerPollPeriod = 1 * time.Second
 
 // NewSourceApiserver creates a config source that polls pods assigned to this
 // node from the apiserver. This custom kubelet path is intentionally watch-free
